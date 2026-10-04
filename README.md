@@ -26,17 +26,20 @@
     - [Installing on a Remote Linux Host](#installing-on-a-remote-linux-host)
   - [Docker Desktop](#docker-desktop)
     - [Installing on Local Windows](#installing-on-local-windows)
-  - [AWS LocalStack](#aws-localstack)
+  - [k3s](#k3s)
     - [Installing on a Remote Linux Host](#installing-on-a-remote-linux-host-1)
+  - [AWS LocalStack](#aws-localstack)
+    - [Installing on a Remote Linux Host](#installing-on-a-remote-linux-host-2)
   - [MailHog](#mailhog)
     - [Installing on Local Windows](#installing-on-local-windows-1)
   - [Redis](#redis)
-    - [Installing on a Remote Linux Host](#installing-on-a-remote-linux-host-2)
-  - [MongoDB](#mongodb)
     - [Installing on a Remote Linux Host](#installing-on-a-remote-linux-host-3)
-  - [PostgreSQL](#postgresql)
-  - [NATS JetStream](#nats-jetstream)
+  - [MongoDB](#mongodb)
     - [Installing on a Remote Linux Host](#installing-on-a-remote-linux-host-4)
+  - [PostgreSQL](#postgresql)
+    - [Installing on a Remote Linux Host](#installing-on-a-remote-linux-host-5)
+  - [NATS JetStream](#nats-jetstream)
+    - [Installing on a Remote Linux Host](#installing-on-a-remote-linux-host-6)
 - [Contributing](#contributing)
 # Install
 ```bash
@@ -532,6 +535,21 @@ Docker Desktop is an easy-to-install application for building, sharing, and runn
   ```bash
   call scripts\docker\install.bat
   ```
+
+## K3s
+### Installing on a Remote Linux Host
+[Back to Top](#table-of-contents)  
+**Commands**
+* Installs K3s on the remote server with Traefik disabled.
+  Check out the script file: [scripts/k3s/install.sh](scripts/k3s/install.sh)  
+  Example of installing K3s on Ubuntu (Noble):
+  ```bash
+  rhctl execute \
+    --host 192.168.75.128 \
+    --user test99 \
+    --password testpwd \
+    --script scripts/k3s/install.sh \
+    --use-sudo
 
 ## AWS LocalStack
 LocalStack is a local AWS cloud stack emulator for testing AWS services.
