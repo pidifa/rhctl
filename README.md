@@ -174,66 +174,98 @@ echo "Remote Execution 1.2"
   ```
 
 
-## rhctl upload
-[Back to Top](#table-of-contents)  
-Upload files/directories with `--transfer` / `--transfer-file`, and/or merge `.env` files with `--patch-env`.
+## rhctl transfer
+[Back to Top](#table-of-contents)
 
-![](./docs/assets/cmd/upload.svg) 
+Transfer files/directories with `--upload` / `--download`, and/or merge `.env` files with `--patch-env` (upload only).
+![](./docs/assets/cmd/transfer.svg)
 
 **Usage**
+
 ```bash
-rhctl upload \
+rhctl transfer \
   --host <host> \
   --user <user> \
   [--ssh-port <port>] \
   [--password <pass>] \
   [--identity <key>] \
   [--certificate <cert>] \
-  [--transfer <local=remote-dir> ...] \
-  [--transfer-file <file>] \
+  [--upload <local=remote-dir> ...] \
+  [--download <remote=local-dir> ...] \
+  [--upload-mapping <file>] \
+  [--download-mapping <file>] \
   [--patch-env <local=.env=remote-.env> ...] \
   [options]
 ```
 
-**Transfer Format** (`--transfer` or each line in `--transfer-file`):
+**Transfer Format** (`--upload` / `--download`):
+
 ```properties
 assets/example1.txt=~/examples
 assets/exampledir=~/examples/targetdir
 ```
-Format: `<local-path>=<remote-directory>`    
 
-Maps local files or directories to target directories on the remote server.   
+For `--upload`: `<local-path>=<remote-directory>`
+Maps local files or directories to target directories on the remote server.
 
-Note: The right-hand side must be a **directory**, not a file path. If it does not exist, it will be created automatically.  
-Note: The file or the contents of the local directory on the left will be uploaded **into** the specified remote directory on the right.  
-Note: Provide at least one of `--transfer`, `--transfer-file`, or `--patch-env`. When `--transfer` and `--transfer-file` are both set, the file is loaded first and `--transfer` overrides the same local path.
+For `--download`: `<remote-path>=<local-directory>`
+Maps remote files or directories to target directories on the local machine.
+
+Note: The right-hand side must be a **directory**, not a file path. If it does not exist, it will be created automatically.
+Note: Files or directory contents are transferred **into** the specified target directory.
+Note: Provide at least one of `--upload`, `--download`, `--upload-mapping`, `--download-mapping`, or `--patch-env`.
+Note: `--patch-env` is only available with upload operations.
+
+**Mapping File** (`--upload-mapping` / `--download-mapping`):
+
+```properties
+assets/example1.txt=~/examples
+assets/exampledir=~/examples/targetdir
+```
+
+Each line uses the same format as the corresponding inline transfer option.
 
 **Patch-env Format** (`--patch-env`):
+
 ```text
 /local/app.env=/etc/rhctl/.env
 ```
+
 Merges local keys into the remote `.env`: local keys overwrite; remote-only keys are kept. Creates the remote file if missing; `chmod 600` (and `700` on `/etc/rhctl` when applicable). Skips blanks and `#` comments.
 
-**Example** (transfer file):
+**Example** (upload):
+
 ```bash
-rhctl upload \
+rhctl transfer \
   --host 192.168.75.128 \
   --user test99 \
-  --transfer-file config/path-mapping.properties
+  --upload assets/example1.txt=~/examples \
+  --upload assets/exampledir=~/examples/targetdir
 ```
 
-**Example** (inline transfers):
+**Example** (download):
+
 ```bash
-rhctl upload \
+rhctl transfer \
   --host 192.168.75.128 \
   --user test99 \
-  --transfer assets/example1.txt=~/examples \
-  --transfer assets/exampledir=~/examples/targetdir
+  --download ~/examples/example1.txt=./downloads \
+  --download ~/examples/exampledir=./downloads
+```
+
+**Example** (upload mapping):
+
+```bash
+rhctl transfer \
+  --host 192.168.75.128 \
+  --user test99 \
+  --upload-mapping config/upload-mapping.properties
 ```
 
 **Example** (patch env):
+
 ```bash
-rhctl upload \
+rhctl transfer \
   --host 192.168.75.128 \
   --user root \
   --patch-env /local/app.env=/etc/rhctl/.env \
@@ -241,52 +273,57 @@ rhctl upload \
 ```
 
 **Required Parameters**:
-- `--host <ip/hostname>`: Remote host IP or hostname
-- `--user <username>`: Remote username
-- At least one of:
-  - `--transfer <local=remote-dir>`: Inline mapping (repeatable)
-  - `--transfer-file <path>`: File of `local=remote-dir` lines
-  - `--patch-env <local=.env=remote-.env>`: Merge local `.env` into remote (repeatable)
+
+* `--host <ip/hostname>`: Remote host IP or hostname
+* `--user <username>`: Remote username
+* At least one of:
+
+  * `--upload <local=remote-dir>`: Upload mapping (repeatable)
+  * `--download <remote=local-dir>`: Download mapping (repeatable)
+  * `--upload-mapping <path>`: File of upload mappings
+  * `--download-mapping <path>`: File of download mappings
+  * `--patch-env <local=.env=remote-.env>`: Merge local `.env` into remote (upload only)
 
 **Optional Parameters**:
-- `--password <password>`: Remote password (optional when `--identity` is set; also used for sudo and as a private-key passphrase fallback)
-- `--identity <path>`: Path to SSH private key (OpenSSH or PEM). Preferred over password when set.  
+
+* `--password <password>`: Remote password (optional when `--identity` is set; also used for sudo and as a private-key passphrase fallback)
+* `--identity <path>`: Path to SSH private key (OpenSSH or PEM). Preferred over password when set.
   Example path values: `~/.ssh/id_ed25519`, `~/.ssh/id_rsa.pem`
-- `--certificate <path>`: Optional OpenSSH certificate (requires `--identity`; not a TLS/X.509 PEM cert).  
+* `--certificate <path>`: Optional OpenSSH certificate (requires `--identity`; not a TLS/X.509 PEM cert).
   Example path values: `~/.ssh/id_ed25519-cert.pub`
-- `--ssh-port <port>`: Remote SSH port (default: 22)
-
-- `--use-sudo`: Run operations with sudo (default: false).
-- `--use-rsync`: Prefer rsync over scp if available (default: false).
-- `--silent`: Suppress prompts. Warning: Use with caution; all overwrite and delete operations will be assumed confirmed (default: false).
-
-- `--connect-timeout <duration>`: Maximum time allowed to establish a connection to the remote server.  
+* `--ssh-port <port>`: Remote SSH port (default: 22)
+* `--use-sudo`: Run operations with sudo (default: false).
+* `--use-rsync`: Prefer rsync over scp if available (default: false).
+* `--silent`: Suppress prompts. Warning: Use with caution; all overwrite and delete operations will be assumed confirmed (default: false).
+* `--connect-timeout <duration>`: Maximum time allowed to establish a connection to the remote server.
   Example duration values: `20s`, `5m`, `1h`
-
-- `--max-sessions-per-server <num>`: Maximum number of active SSH sessions allowed per server.
-- `--max-channels-per-session <num>`: Maximum number of concurrent channels allowed per SSH session. 
-- `--session-acquire-timeout <duration>`: Maximum time to wait for acquiring a session from the session pool.  
+* `--max-sessions-per-server <num>`: Maximum number of active SSH sessions allowed per server.
+* `--max-channels-per-session <num>`: Maximum number of concurrent channels allowed per SSH session.
+* `--session-acquire-timeout <duration>`: Maximum time to wait for acquiring a session from the session pool.
   Example duration values: `20s`, `5m`, `1h`
-- `--max-session-lifetime <duration>`: Maximum lifetime of an SSH session before it is automatically closed.  
+* `--max-session-lifetime <duration>`: Maximum lifetime of an SSH session before it is automatically closed.
   Example duration values: `20s`, `5m`, `1h`
 
 **Optional Global Parameters**:
-- `--debug`: Enable debug logging (default: info).
-- Path placeholders `${NAME}` are expanded from the process environment.  
-  Example:  
-    ```properties
-    ${ASSETS_ROOT}/example1.txt=~/examples
-    ${ASSETS_ROOT}/exampledir=~/examples/targetdir
-    ```
-    ```bash
-    export ASSETS_ROOT=/path/to/assets
-    rhctl upload \
-      --host 192.168.75.128 \
-      --user test99 \
-      --ssh-port 22 \
-      --use-sudo \
-      --transfer-file config/path-mapping.properties
-    ```
+
+* `--debug`: Enable debug logging (default: info).
+* Path placeholders `${NAME}` are expanded from the process environment.
+  Example:
+
+  ```properties
+  ${ASSETS_ROOT}/example1.txt=~/examples
+  ${ASSETS_ROOT}/exampledir=~/examples/targetdir
+  ```
+
+  ```bash
+  export ASSETS_ROOT=/path/to/assets
+  rhctl transfer \
+    --host 192.168.75.128 \
+    --user test99 \
+    --ssh-port 22 \
+    --use-sudo \
+    --upload-mapping config/upload-mapping.properties
+  ```
 
 ## rhctl patch
 [Back to Top](#table-of-contents)  

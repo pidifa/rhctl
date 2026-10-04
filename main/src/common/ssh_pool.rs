@@ -15,9 +15,9 @@ use crate::domain::constants::{
     SUDO_ERR_MSG, SYSTEM_TASK_NAME,
 };
 use crate::domain::yml_config::ServerConfig;
-use crate::utils::file_utils::{generate_remote_temp_dir, get_local_path_base_name};
+use crate::utils::file_utils::{expand_local_user_path, generate_remote_temp_dir, get_local_path_base_name};
 use crate::utils::log_utils::ask_user;
-use crate::utils::ssh_utils::{CrProgressPrinter, feed_remote_stream};
+use crate::utils::ssh_utils::{feed_remote_stream, CrProgressPrinter};
 use crate::{log_debug, log_error_direct, log_info, log_warn, log_warn_direct};
 use async_recursion::async_recursion;
 use async_trait::async_trait;
@@ -25,18 +25,19 @@ use dashmap::DashMap;
 use dashmap::DashSet;
 use dirs_next as dirs;
 use futures::stream::{FuturesUnordered, StreamExt};
-use russh::ChannelMsg;
 use russh::client::{Config, Handler};
 use russh::client::{Handle, Msg};
-use russh_keys::PublicKeyBase64;
+use russh::ChannelMsg;
 use russh_keys::key::PublicKey;
+use russh_keys::PublicKeyBase64;
 use russh_keys::{load_openssh_certificate, load_secret_key};
-use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashSet;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::io::{self, BufReader, Cursor, Read, Write};
 use std::path::Path;
+use std::path::PathBuf;
 use std::process::exit;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -272,7 +273,7 @@ impl SessionPool {
 
         // Prefer identity / certificate auth when configured, then fall back to password.
         if let Some(ref identity_path) = self.server_metadata.identity_file {
-            let identity_path = expand_user_path(identity_path);
+            let identity_path = expand_local_user_path(identity_path);
             let key_pair = match load_secret_key(&identity_path, None) {
                 Ok(key) => key,
                 Err(first_err) => {
@@ -294,7 +295,7 @@ impl SessionPool {
             };
 
             let key_auth_ok = if let Some(ref cert_path) = self.server_metadata.certificate_file {
-                let cert_path = expand_user_path(cert_path);
+                let cert_path = expand_local_user_path(cert_path);
                 let cert = load_openssh_certificate(&cert_path).map_err(|e| {
                     SshError::Custom(format!(
                         "Failed to load OpenSSH certificate '{}': {}",
@@ -862,9 +863,8 @@ impl ServerPool {
             flag
         );
 
-        let quoted_path = shlex::try_quote(path).map_err(|e| {
-            format!("Invalid remote path '{}': {}", path, e)
-        })?;
+        let quoted_path =
+            shlex::try_quote(path).map_err(|e| format!("Invalid remote path '{}': {}", path, e))?;
         let full_cmd = format!("test {} {}", flag, quoted_path);
         let result = self
             .exec(server_metadata, task_name, &full_cmd, use_sudo)
@@ -950,227 +950,204 @@ impl ServerPool {
             .await
     }
 
-async fn exec_with_stream(
-    &self,
-    server_metadata: &Arc<ServerMetadata>,
-    task_name: &str,
-    cmd: &str,
-    use_sudo: bool,
-    print_log: bool,
-) -> Result<String, String> {
-    let cmd = cmd.to_string();
-    let mut channel_guard = self.get_channel(server_metadata).await?;
+    async fn exec_with_stream(
+        &self,
+        server_metadata: &Arc<ServerMetadata>,
+        task_name: &str,
+        cmd: &str,
+        use_sudo: bool,
+        print_log: bool,
+    ) -> Result<String, String> {
+        let cmd = cmd.to_string();
+        let mut channel_guard = self.get_channel(server_metadata).await?;
 
-    log_debug!(
-        server_metadata,
-        task_name,
-        "Streaming command: {} (sudo: {})",
-        cmd,
-        use_sudo
-    );
+        log_debug!(
+            server_metadata,
+            task_name,
+            "Streaming command: {} (sudo: {})",
+            cmd,
+            use_sudo
+        );
 
-    let full_cmd = if use_sudo {
-        let quoted = shlex::try_quote(cmd.as_str())
-            .map_err(|e| format!("Failed to quote sudo command: {}", e))?;
+        let full_cmd = if use_sudo {
+            let quoted = shlex::try_quote(cmd.as_str())
+                .map_err(|e| format!("Failed to quote sudo command: {}", e))?;
 
-        // Use an explicit prompt so we can distinguish the sudo password
-        // request from normal command output.
-        format!(
-            "sudo -S -p '[RHCTL_SUDO_PASSWORD]' bash -c {}",
-            quoted
-        )
-    } else {
-        cmd.to_string()
-    };
+            // Use an explicit prompt so we can distinguish the sudo password
+            // request from normal command output.
+            format!("sudo -S -p '[RHCTL_SUDO_PASSWORD]' bash -c {}", quoted)
+        } else {
+            cmd.to_string()
+        };
 
-    log_debug!(
-        server_metadata,
-        task_name,
-        "Full command: {} (sudo: {})",
-        full_cmd,
-        use_sudo
-    );
+        log_debug!(
+            server_metadata,
+            task_name,
+            "Full command: {} (sudo: {})",
+            full_cmd,
+            use_sudo
+        );
 
-    if use_sudo {
+        if use_sudo {
+            channel_guard
+                .channel
+                .request_pty(true, "xterm", 0, 0, 0, 0, &[])
+                .await
+                .map_err(|e| format!("Failed to request pty for sudo. \n\t> {}", e))?;
+        }
+
         channel_guard
             .channel
-            .request_pty(true, "xterm", 0, 0, 0, 0, &[])
+            .exec(true, full_cmd.as_bytes().to_vec())
             .await
-            .map_err(|e| format!("Failed to request pty for sudo. \n\t> {}", e))?;
-    }
+            .map_err(|e| format!("Failed to execute command '{}'. \n\t> {}", cmd, e))?;
 
-    channel_guard
-        .channel
-        .exec(true, full_cmd.as_bytes().to_vec())
-        .await
-        .map_err(|e| format!("Failed to execute command '{}'. \n\t> {}", cmd, e))?;
+        let mut stdout_buf = String::new();
+        let mut stderr_buf = String::new();
 
-    let mut stdout_buf = String::new();
-    let mut stderr_buf = String::new();
+        let mut skip_sudo_blank = use_sudo;
+        let mut stdout_collected = Vec::new();
+        let mut stderr_collected = Vec::new();
 
-    let mut skip_sudo_blank = use_sudo;
-    let mut stdout_collected = Vec::new();
-    let mut stderr_collected = Vec::new();
+        let mut partial_stdout = String::new();
+        let mut partial_stderr = String::new();
 
-    let mut partial_stdout = String::new();
-    let mut partial_stderr = String::new();
+        let mut stdout_progress = CrProgressPrinter::new();
+        let mut stderr_progress = CrProgressPrinter::new();
 
-    let mut stdout_progress = CrProgressPrinter::new();
-    let mut stderr_progress = CrProgressPrinter::new();
+        let mut saw_exit_status = false;
+        let mut sudo_password_sent = !use_sudo;
 
-    let mut saw_exit_status = false;
-    let mut sudo_password_sent = !use_sudo;
-
-    while let Some(msg) = channel_guard.channel.wait().await {
-        match msg {
-            ChannelMsg::Data { data } => {
-                let data_str = String::from_utf8_lossy(&data);
-
-                // sudo may send its password prompt through the PTY.
-                if use_sudo
-                    && !sudo_password_sent
-                    && data_str.contains("[RHCTL_SUDO_PASSWORD]")
-                {
-                    let pw_with_newline = format!("{}\n", server_metadata.password);
-
-                    channel_guard
-                        .channel
-                        .data(pw_with_newline.as_bytes())
-                        .await
-                        .map_err(|e| {
-                            format!("Failed to send sudo password. \n\t> {}", e)
-                        })?;
-
-                    sudo_password_sent = true;
-
-                    // Do not expose the sudo password prompt in command output.
-                    continue;
-                }
-
-                stdout_collected.extend_from_slice(&data);
-
-                if print_log {
-                    feed_remote_stream(
-                        &mut partial_stdout,
-                        &mut stdout_progress,
-                        &data_str,
-                        server_metadata,
-                        task_name,
-                        &mut skip_sudo_blank,
-                    )?;
-                }
-            }
-
-            ChannelMsg::ExtendedData { data, ext } if ext == 1 => {
-                stderr_collected.extend_from_slice(&data);
-
-                if print_log {
+        while let Some(msg) = channel_guard.channel.wait().await {
+            match msg {
+                ChannelMsg::Data { data } => {
                     let data_str = String::from_utf8_lossy(&data);
 
-                    // Remote stderr (e.g. curl progress) streams as REMOTE, not ERROR.
-                    let mut no_sudo_skip = false;
+                    // sudo may send its password prompt through the PTY.
+                    if use_sudo && !sudo_password_sent && data_str.contains("[RHCTL_SUDO_PASSWORD]")
+                    {
+                        let pw_with_newline = format!("{}\n", server_metadata.password);
 
-                    feed_remote_stream(
-                        &mut partial_stderr,
-                        &mut stderr_progress,
-                        &data_str,
-                        server_metadata,
-                        task_name,
-                        &mut no_sudo_skip,
-                    )?;
+                        channel_guard
+                            .channel
+                            .data(pw_with_newline.as_bytes())
+                            .await
+                            .map_err(|e| format!("Failed to send sudo password. \n\t> {}", e))?;
+
+                        sudo_password_sent = true;
+
+                        // Do not expose the sudo password prompt in command output.
+                        continue;
+                    }
+
+                    stdout_collected.extend_from_slice(&data);
+
+                    if print_log {
+                        feed_remote_stream(
+                            &mut partial_stdout,
+                            &mut stdout_progress,
+                            &data_str,
+                            server_metadata,
+                            task_name,
+                            &mut skip_sudo_blank,
+                        )?;
+                    }
                 }
-            }
 
-            ChannelMsg::ExitStatus { exit_status } => {
-                saw_exit_status = true;
+                ChannelMsg::ExtendedData { data, ext } if ext == 1 => {
+                    stderr_collected.extend_from_slice(&data);
 
-                if exit_status != 0 {
-                    let stdout_str = String::from_utf8_lossy(&stdout_collected);
-                    let stderr_str = String::from_utf8_lossy(&stderr_collected);
+                    if print_log {
+                        let data_str = String::from_utf8_lossy(&data);
 
-                    let mut msg;
+                        // Remote stderr (e.g. curl progress) streams as REMOTE, not ERROR.
+                        let mut no_sudo_skip = false;
 
-                    if stderr_str.contains(SUDO_ERR_MSG) {
-                        msg = format!(
+                        feed_remote_stream(
+                            &mut partial_stderr,
+                            &mut stderr_progress,
+                            &data_str,
+                            server_metadata,
+                            task_name,
+                            &mut no_sudo_skip,
+                        )?;
+                    }
+                }
+
+                ChannelMsg::ExitStatus { exit_status } => {
+                    saw_exit_status = true;
+
+                    if exit_status != 0 {
+                        let stdout_str = String::from_utf8_lossy(&stdout_collected);
+                        let stderr_str = String::from_utf8_lossy(&stderr_collected);
+
+                        let mut msg;
+
+                        if stderr_str.contains(SUDO_ERR_MSG) {
+                            msg = format!(
                             "Detected 'sudo' at the start of a command line, but 'use_sudo' is not enabled. Enable 'use_sudo' to run commands with sudo. \n\t> Command line: \n{}",
                             cmd
                         );
-                    } else {
-                        msg = format!(
-                            "Command failed with exit status {}. \n\t> Command line: \n{}",
-                            exit_status, cmd
-                        );
+                        } else {
+                            msg = format!(
+                                "Command failed with exit status {}. \n\t> Command line: \n{}",
+                                exit_status, cmd
+                            );
 
-                        if !stdout_str.trim().is_empty() {
-                            msg.push_str(&format!(
-                                "\nRemote Output:\n\t{}",
-                                stdout_str
-                            ));
+                            if !stdout_str.trim().is_empty() {
+                                msg.push_str(&format!("\nRemote Output:\n\t{}", stdout_str));
+                            }
+
+                            if !stderr_str.trim().is_empty() {
+                                msg.push_str(&format!("\nRemote Error:\n\t{}", stderr_str));
+                            }
                         }
 
-                        if !stderr_str.trim().is_empty() {
-                            msg.push_str(&format!(
-                                "\nRemote Error:\n\t{}",
-                                stderr_str
-                            ));
-                        }
+                        return Err(msg);
                     }
 
-                    return Err(msg);
+                    break;
                 }
 
-                break;
+                _ => continue,
+            }
+        }
+
+        if !saw_exit_status {
+            return Err(format!(
+                "Command finished without an exit status. \n\t> Command line: \n{}",
+                cmd
+            ));
+        }
+
+        if print_log {
+            stdout_progress.flush(server_metadata, task_name)?;
+            if !partial_stdout.is_empty()
+                && !(use_sudo && skip_sudo_blank && partial_stdout.trim().is_empty())
+            {
+                stdout_progress.on_lf(&partial_stdout, server_metadata, task_name)?;
             }
 
-            _ => continue,
-        }
-    }
+            stderr_progress.flush(server_metadata, task_name)?;
 
-    if !saw_exit_status {
-        return Err(format!(
-            "Command finished without an exit status. \n\t> Command line: \n{}",
-            cmd
-        ));
-    }
-
-    if print_log {
-        stdout_progress.flush(server_metadata, task_name)?;
-        if !partial_stdout.is_empty()
-            && !(use_sudo
-                && skip_sudo_blank
-                && partial_stdout.trim().is_empty())
-        {
-            stdout_progress.on_lf(
-                &partial_stdout,
-                server_metadata,
-                task_name,
-            )?;
+            if !partial_stderr.is_empty() {
+                stderr_progress.on_lf(&partial_stderr, server_metadata, task_name)?;
+            }
         }
 
-        stderr_progress.flush(server_metadata, task_name)?;
+        stdout_buf = String::from_utf8_lossy(&stdout_collected).to_string();
+        stderr_buf = String::from_utf8_lossy(&stderr_collected).to_string();
 
-        if !partial_stderr.is_empty() {
-            stderr_progress.on_lf(
-                &partial_stderr,
-                server_metadata,
-                task_name,
-            )?;
-        }
+        channel_guard
+            .channel
+            .close()
+            .await
+            .map_err(|e| format!("Failed to close channel. \n\t> {}", e))?;
+
+        stdout_buf = stdout_buf.trim().to_string();
+
+        Ok(stdout_buf)
     }
-
-    stdout_buf = String::from_utf8_lossy(&stdout_collected).to_string();
-    stderr_buf = String::from_utf8_lossy(&stderr_collected).to_string();
-
-    channel_guard
-        .channel
-        .close()
-        .await
-        .map_err(|e| format!("Failed to close channel. \n\t> {}", e))?;
-
-    stdout_buf = stdout_buf.trim().to_string();
-
-    Ok(stdout_buf)
-}
 
     pub async fn upload_file_or_dir_contents_into_dir(
         &self,
@@ -1312,6 +1289,507 @@ async fn exec_with_stream(
             }
         }
 
+        Ok(())
+    }
+
+    pub async fn download_file_or_dir_contents_into_dir(
+        &self,
+        server_metadata: &Arc<ServerMetadata>,
+        task_name: &str,
+        remote_file_or_dir: &str,
+        local_dir: &Path,
+        use_sudo: bool,
+        use_rsync: bool,
+        silent: bool,
+        print_log: bool,
+    ) -> Result<(), String> {
+        if !local_dir.exists() {
+            std::fs::create_dir_all(local_dir).map_err(|e| {
+                format!(
+                    "Failed to create local download directory '{}'. \n\t> {}",
+                    local_dir.display(),
+                    e
+                )
+            })?;
+        }
+        if !local_dir.is_dir() {
+            return Err(format!(
+                "Local download target '{}' is not a directory",
+                local_dir.display()
+            ));
+        }
+
+        let mut remote_source = remote_file_or_dir.to_string();
+        let mut remote_temp_dir: Option<String> = None;
+
+        if use_sudo && server_metadata.user != "root" {
+            let temp_dir = self
+                .create_remote_temp_dir(server_metadata, task_name, "download", use_sudo)
+                .await?;
+            let quoted_source = shlex::try_quote(remote_file_or_dir)
+                .map_err(|e| format!("Invalid remote path '{}': {}", remote_file_or_dir, e))?;
+            let quoted_temp = shlex::try_quote(&temp_dir)
+                .map_err(|e| format!("Invalid remote temp path '{}': {}", temp_dir, e))?;
+            self.exec(
+                server_metadata,
+                task_name,
+                &format!("cp -a {} {}/", quoted_source, quoted_temp),
+                use_sudo,
+            )
+            .await?;
+            let base = self
+                .exec(
+                    server_metadata,
+                    task_name,
+                    &format!("basename -- {}", quoted_source),
+                    use_sudo,
+                )
+                .await?
+                .trim()
+                .to_string();
+            if base.is_empty() || base == "." || base == ".." {
+                return Err(format!(
+                    "Failed to determine basename of remote path '{}'",
+                    remote_file_or_dir
+                ));
+            }
+            remote_source = format!("{}/{}", temp_dir, base);
+            self.exec(
+                server_metadata,
+                task_name,
+                &format!(
+                    "chown -R {} {}",
+                    shlex::try_quote(&server_metadata.user)
+                        .map_err(|e| format!("Invalid username: {}", e))?,
+                    quoted_temp
+                ),
+                true,
+            )
+            .await?;
+            remote_temp_dir = Some(temp_dir);
+        }
+
+        let source_is_dir = self
+            .dir_exists(server_metadata, task_name, &remote_source, false)
+            .await?;
+        let result = self
+            .do_download(
+                server_metadata,
+                task_name,
+                &remote_source,
+                local_dir,
+                use_rsync && remote_temp_dir.is_none(),
+                source_is_dir,
+                silent,
+            )
+            .await;
+
+        if let Some(temp_dir) = remote_temp_dir {
+            let cleanup = self
+                .exec(
+                    server_metadata,
+                    task_name,
+                    &format!("rm -rf {}", shlex::try_quote(&temp_dir).unwrap()),
+                    true,
+                )
+                .await;
+            if let Err(e) = cleanup {
+                if result.is_ok() {
+                    return Err(format!(
+                        "Download succeeded but remote temporary directory cleanup failed: {}",
+                        e
+                    ));
+                }
+            }
+        }
+
+        result?;
+        if print_log {
+            log_info!(
+                server_metadata,
+                task_name,
+                "Successfully downloaded '{}' into '{}'",
+                remote_file_or_dir,
+                local_dir.display()
+            );
+        }
+        Ok(())
+    }
+
+    async fn do_download(
+        &self,
+        server_metadata: &Arc<ServerMetadata>,
+        task_name: &str,
+        remote_source: &str,
+        local_dir: &Path,
+        use_rsync: bool,
+        source_is_dir: bool,
+        silent: bool,
+    ) -> Result<(), String> {
+        let stage_dir = std::env::temp_dir().join(format!(
+            "rhctl-download-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&stage_dir).map_err(|e| {
+            format!(
+                "Failed to create local download staging directory '{}': {}",
+                stage_dir.display(),
+                e
+            )
+        })?;
+
+        let result = if use_rsync && self.command_exists("rsync") {
+            self.do_download_with_rsync(server_metadata, task_name, remote_source, &stage_dir)
+                .await
+        } else {
+            self.do_download_with_scp(
+                server_metadata,
+                task_name,
+                remote_source,
+                &stage_dir,
+                source_is_dir,
+            )
+            .await
+        };
+
+        let merge_result = match result {
+            Ok(()) => {
+                self.merge_download_stage(&stage_dir, local_dir, silent, server_metadata, task_name)
+                    .await
+            }
+            Err(e) => Err(e),
+        };
+        let _ = std::fs::remove_dir_all(&stage_dir);
+        merge_result
+    }
+
+    async fn do_download_with_rsync(
+        &self,
+        server_metadata: &Arc<ServerMetadata>,
+        task_name: &str,
+        remote_source: &str,
+        stage_dir: &Path,
+    ) -> Result<(), String> {
+        let remote_spec = format!(
+            "{}@{}:{}",
+            server_metadata.user, server_metadata.host, remote_source
+        );
+        let status = if let Some(ref identity_file) = server_metadata.identity_file {
+            let identity_path = expand_local_user_path(identity_file);
+            let ssh_cmd = format!("ssh -p {} -i {}", server_metadata.ssh_port, identity_path);
+            std::process::Command::new("rsync")
+                .arg("-a")
+                .arg("-e")
+                .arg(&ssh_cmd)
+                .arg(&remote_spec)
+                .arg(stage_dir)
+                .status()
+                .map_err(|e| format!("Failed to execute rsync download with identity: {}", e))?
+        } else if !server_metadata.password.is_empty() && self.command_exists("sshpass") {
+            std::process::Command::new("sshpass")
+                .arg("-p")
+                .arg(&server_metadata.password)
+                .arg("rsync")
+                .arg("-a")
+                .arg("-e")
+                .arg(format!("ssh -p {}", server_metadata.ssh_port))
+                .arg(&remote_spec)
+                .arg(stage_dir)
+                .status()
+                .map_err(|e| format!("Failed to execute rsync download via sshpass: {}", e))?
+        } else {
+            return Err(
+                "rsync download requires an identity file or sshpass for password authentication"
+                    .to_string(),
+            );
+        };
+        if !status.success() {
+            return Err(format!(
+                "rsync download failed with exit code {}",
+                status.code().unwrap_or(-1)
+            ));
+        }
+        log_debug!(
+            server_metadata,
+            task_name,
+            "rsync download from '{}' completed",
+            remote_source
+        );
+        Ok(())
+    }
+
+    async fn do_download_with_scp(
+        &self,
+        server_metadata: &Arc<ServerMetadata>,
+        task_name: &str,
+        remote_source: &str,
+        stage_dir: &Path,
+        source_is_dir: bool,
+    ) -> Result<(), String> {
+        let quoted_source = shlex::try_quote(remote_source)
+            .map_err(|e| format!("Invalid remote path '{}': {}", remote_source, e))?;
+        let mut channel_guard = self.get_channel(server_metadata).await?;
+        let command = format!("scp -f {}", quoted_source);
+        channel_guard
+            .channel
+            .exec(true, command.as_bytes().to_vec())
+            .await
+            .map_err(|e| format!("Failed to start remote SCP sender: {}", e))?;
+
+        let mut pending = Vec::new();
+        self.scp_send_ack(&mut channel_guard.channel).await?;
+        self.scp_receive_entries(
+            &mut channel_guard.channel,
+            &mut pending,
+            stage_dir,
+            source_is_dir,
+        )
+        .await?;
+        channel_guard
+            .channel
+            .close()
+            .await
+            .map_err(|e| e.to_string())?;
+        log_debug!(
+            server_metadata,
+            task_name,
+            "SCP download from '{}' completed",
+            remote_source
+        );
+        Ok(())
+    }
+
+    async fn scp_send_ack(&self, channel: &mut russh::Channel<Msg>) -> Result<(), String> {
+        let mut cursor = Cursor::new(&[0u8]);
+        channel.data(&mut cursor).await.map_err(|e| e.to_string())
+    }
+
+    async fn scp_next_data(
+        &self,
+        channel: &mut russh::Channel<Msg>,
+        pending: &mut Vec<u8>,
+    ) -> Result<(), String> {
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                ChannelMsg::Data { data } => {
+                    pending.extend_from_slice(&data);
+                    return Ok(());
+                }
+                ChannelMsg::ExtendedData { data, .. } => {
+                    return Err(format!(
+                        "SCP remote error: {}",
+                        String::from_utf8_lossy(&data)
+                    ));
+                }
+                ChannelMsg::ExitStatus { exit_status } => {
+                    return Err(format!("SCP process exited with status {}", exit_status));
+                }
+                _ => {}
+            }
+        }
+        Err("SCP connection closed before transfer completed".to_string())
+    }
+
+    async fn scp_read_line(
+        &self,
+        channel: &mut russh::Channel<Msg>,
+        pending: &mut Vec<u8>,
+    ) -> Result<String, String> {
+        loop {
+            if let Some(pos) = pending.iter().position(|b| *b == b'\n') {
+                let line = pending.drain(..=pos).collect::<Vec<_>>();
+                return String::from_utf8(line[..line.len() - 1].to_vec())
+                    .map_err(|e| format!("Invalid SCP header: {}", e));
+            }
+            self.scp_next_data(channel, pending).await?;
+        }
+    }
+
+    async fn scp_read_exact(
+        &self,
+        channel: &mut russh::Channel<Msg>,
+        pending: &mut Vec<u8>,
+        size: usize,
+        output: &mut File,
+    ) -> Result<(), String> {
+        let mut remaining = size;
+        while remaining > 0 {
+            if pending.is_empty() {
+                self.scp_next_data(channel, pending).await?;
+            }
+            let take = remaining.min(pending.len());
+            output
+                .write_all(&pending[..take])
+                .map_err(|e| e.to_string())?;
+            pending.drain(..take);
+            remaining -= take;
+        }
+        Ok(())
+    }
+
+    async fn scp_receive_entries(
+        &self,
+        channel: &mut russh::Channel<Msg>,
+        pending: &mut Vec<u8>,
+        root: &Path,
+        source_is_dir: bool,
+    ) -> Result<(), String> {
+        let mut dirs: Vec<PathBuf> = vec![root.to_path_buf()];
+        loop {
+            if pending.is_empty() {
+                self.scp_next_data(channel, pending).await?;
+            }
+            match pending[0] {
+                0 => {
+                    pending.remove(0);
+                    continue;
+                }
+                1 | 2 => {
+                    let code = pending.remove(0);
+                    let msg = self.scp_read_line(channel, pending).await?;
+                    return Err(format!("SCP remote error {}: {}", code, msg));
+                }
+                b'D' => {
+                    let line = self.scp_read_line(channel, pending).await?;
+                    let mut parts = line[1..].splitn(2, ' ');
+                    let _mode = parts.next().unwrap_or("0755");
+                    let rest = parts.next().unwrap_or("");
+                    let mut rest_parts = rest.splitn(2, ' ');
+                    let _size = rest_parts.next().unwrap_or("0");
+                    let name = rest_parts.next().unwrap_or("");
+                    if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+                        return Err(format!("Invalid SCP directory name '{}': {}", name, line));
+                    }
+                    let path = dirs.last().unwrap().join(name);
+                    std::fs::create_dir_all(&path)
+                        .map_err(|e| format!("Failed to create '{}': {}", path.display(), e))?;
+                    self.scp_send_ack(channel).await?;
+                    dirs.push(path);
+                }
+                b'E' => {
+                    let _ = self.scp_read_line(channel, pending).await?;
+                    if dirs.len() <= 1 {
+                        self.scp_send_ack(channel).await?;
+                        return Ok(());
+                    }
+                    dirs.pop();
+                    self.scp_send_ack(channel).await?;
+                }
+                b'C' => {
+                    let line = self.scp_read_line(channel, pending).await?;
+                    let mut parts = line[1..].splitn(3, ' ');
+                    let _mode = parts.next().unwrap_or("0644");
+                    let size: usize = parts
+                        .next()
+                        .unwrap_or("0")
+                        .parse()
+                        .map_err(|e| format!("Invalid SCP file size: {}", e))?;
+                    let name = parts.next().unwrap_or("");
+                    if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+                        return Err(format!("Invalid SCP file name '{}': {}", name, line));
+                    }
+                    let path = dirs.last().unwrap().join(name);
+                    let mut file = File::create(&path)
+                        .map_err(|e| format!("Failed to create '{}': {}", path.display(), e))?;
+                    self.scp_send_ack(channel).await?;
+                    self.scp_read_exact(channel, pending, size, &mut file)
+                        .await?;
+                    self.scp_send_ack(channel).await?;
+                    if !source_is_dir && dirs.len() == 1 {
+                        return Ok(());
+                    }
+                }
+                other => return Err(format!("Unexpected SCP protocol byte: {}", other)),
+            }
+        }
+    }
+
+    async fn merge_download_stage(
+        &self,
+        stage_dir: &Path,
+        local_dir: &Path,
+        silent: bool,
+        server_metadata: &Arc<ServerMetadata>,
+        task_name: &str,
+    ) -> Result<(), String> {
+        let entries = std::fs::read_dir(stage_dir)
+            .map_err(|e| format!("Failed to read download staging directory: {}", e))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to read download staging entry: {}", e))?;
+        if entries.len() != 1 {
+            return Err("SCP download produced an unexpected staging layout".to_string());
+        }
+        let source = entries[0].path();
+        let target = local_dir.join(entries[0].file_name());
+        if source.is_dir() {
+            let children = std::fs::read_dir(&source).map_err(|e| {
+                format!(
+                    "Failed to read downloaded directory '{}': {}",
+                    source.display(),
+                    e
+                )
+            })?;
+            for child in children {
+                let child = child.map_err(|e| e.to_string())?;
+                let target_child = local_dir.join(child.file_name());
+                if target_child.exists() {
+                    ask_user(
+                        server_metadata,
+                        task_name,
+                        &format!(
+                            "Local path '{}' already exists. Overwrite it?",
+                            target_child.display()
+                        ),
+                        silent,
+                    )
+                    .await?;
+                    if target_child.is_dir() {
+                        std::fs::remove_dir_all(&target_child)
+                    } else {
+                        std::fs::remove_file(&target_child)
+                    }
+                    .map_err(|e| format!("Failed to remove '{}': {}", target_child.display(), e))?;
+                }
+                std::fs::rename(child.path(), &target_child).map_err(|e| {
+                    format!(
+                        "Failed to move downloaded item to '{}': {}",
+                        target_child.display(),
+                        e
+                    )
+                })?;
+            }
+            let _ = std::fs::remove_dir_all(&source);
+        } else {
+            if target.exists() {
+                ask_user(
+                    server_metadata,
+                    task_name,
+                    &format!(
+                        "Local path '{}' already exists. Overwrite it?",
+                        target.display()
+                    ),
+                    silent,
+                )
+                .await?;
+                if target.is_dir() {
+                    std::fs::remove_dir_all(&target)
+                } else {
+                    std::fs::remove_file(&target)
+                }
+                .map_err(|e| format!("Failed to remove '{}': {}", target.display(), e))?;
+            }
+            std::fs::rename(source, &target).map_err(|e| {
+                format!(
+                    "Failed to move downloaded file to '{}': {}",
+                    target.display(),
+                    e
+                )
+            })?;
+        }
         Ok(())
     }
 
@@ -1535,11 +2013,8 @@ async fn exec_with_stream(
             );
 
             if let Some(ref identity_file) = server_metadata.identity_file {
-                let identity_path = expand_user_path(identity_file);
-                let ssh_cmd = format!(
-                    "ssh -p {} -i {}",
-                    server_metadata.ssh_port, identity_path
-                );
+                let identity_path = expand_local_user_path(identity_file);
+                let ssh_cmd = format!("ssh -p {} -i {}", server_metadata.ssh_port, identity_path);
                 let status = std::process::Command::new("rsync")
                     .arg("-avz")
                     .arg("-e")
@@ -1829,16 +2304,3 @@ fn is_exit_status(err: &str, code: u32) -> bool {
     digits.parse::<u32>().ok() == Some(code)
 }
 
-/// Expand a leading `~/` to the user's home directory.
-fn expand_user_path(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest).to_string_lossy().into_owned();
-        }
-    } else if path == "~" {
-        if let Some(home) = dirs::home_dir() {
-            return home.to_string_lossy().into_owned();
-        }
-    }
-    path.to_string()
-}

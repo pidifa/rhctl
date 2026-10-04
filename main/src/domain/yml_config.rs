@@ -53,18 +53,18 @@ impl Hash for ServerConfig {
 
 #[derive(Clone, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
-pub struct UploadStep {
+pub struct TransferStep {
     pub use_rsync: Option<bool>,
     pub use_sudo: Option<bool>,
     pub silent: Option<bool>,
-
-    /// Path to a transfer file (`local=remote-dir` per line).
-    #[serde(default, alias = "properties-file")]
-    pub transfer_file: Option<String>,
-    /// Inline transfers (`local=remote-dir`).
     #[serde(default)]
-    pub transfers: Vec<String>,
-    /// Merge local `.env` into remote file (`local=remote-file`).
+    pub upload_mapping: Option<String>,
+    #[serde(default)]
+    pub downloads: Vec<String>,
+    #[serde(default)]
+    pub download_mapping: Option<String>,
+    #[serde(default)]
+    pub uploads: Vec<String>,
     #[serde(default)]
     pub patch_envs: Vec<String>,
 
@@ -129,7 +129,7 @@ pub struct ExecuteStep {
 #[derive(Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum RunStep {
-    Upload(UploadStep),
+    Transfer(TransferStep),
     Execute(ExecuteStep),
     Patch(PatchStep),
 }

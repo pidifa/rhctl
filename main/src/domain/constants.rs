@@ -12,8 +12,7 @@ use std::{collections::HashSet, time::Duration};
 
 pub static REMOTE_TEMP_RHCTL_FOLDER: &str = "/tmp/rhctl";
 pub static USER_ABORTED_MESSAGE: &str = "Operation aborted by user";
-
-pub const UPLOAD_TASK_NAME: &str = "UPLOAD";
+pub const TRANSFER_TASK_NAME: &str = "TRANSFER";
 pub const EXECUTE_TASK_NAME: &str = "EXECUTE";
 pub const PATCH_TASK_NAME: &str = "PATCH";
 pub const SYSTEM_TASK_NAME: &str = "SYSTEM";

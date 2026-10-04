@@ -14,16 +14,16 @@ use std::time::Duration;
 
 use crate::common::ssh_pool::ServerPool;
 use crate::domain::cmd_params::{
-    parse_script_invocation, ExecuteCmdConfig, PatchCmdConfig, ServerMetadata, UploadCmdConfig,
+    parse_script_invocation, ExecuteCmdConfig, PatchCmdConfig, ServerMetadata, TransferCmdConfig,
 };
 use crate::domain::constants::{
     DEFAULT_CONNECT_TIMEOUT, DEFAULT_EXECUTE_MODE, DEFAULT_EXECUTE_WORK_PATH,
-    DEFAULT_MAX_CHANNELS_PER_SESSION, DEFAULT_MAX_SESSION_LIFETIME,
-    DEFAULT_MAX_SESSIONS_PER_SERVER, DEFAULT_SESSION_ACQUIRE_TIMEOUT, DEFAULT_SSH_PORT,
-    EXECUTE_TASK_NAME, PATCH_TASK_NAME, UPLOAD_TASK_NAME,
+    DEFAULT_MAX_CHANNELS_PER_SESSION, DEFAULT_MAX_SESSIONS_PER_SERVER,
+    DEFAULT_MAX_SESSION_LIFETIME, DEFAULT_SESSION_ACQUIRE_TIMEOUT, DEFAULT_SSH_PORT,
+    EXECUTE_TASK_NAME, PATCH_TASK_NAME, TRANSFER_TASK_NAME,
 };
 use crate::domain::yml_config::{
-    ExecuteStep, NamedConfig, PatchStep, RunStep, ServerConfig, UploadStep, YmlConfig,
+    ExecuteStep, NamedConfig, PatchStep, RunStep, ServerConfig, TransferStep, YmlConfig,
 };
 use crate::utils::file_utils::{expand_vars, substitute_vars, validate_path_chars};
 use crate::utils::log_utils::prompt_password_or_exit;
@@ -38,9 +38,6 @@ fn resolve_script_invocation(
     validate_path_chars(&inv.path)?;
     Ok(inv)
 }
-
-/// Resolve SSH credentials: prefer identity/certificate; password is required only when no identity is set.
-/// Password remains optional with identity (used for sudo and password fallback).
 fn resolve_auth(
     password: Option<String>,
     identity_file: Option<String>,
@@ -58,16 +55,13 @@ fn resolve_auth(
         );
         exit(1);
     }
-
     let password = if identity_file.is_some() {
         password.unwrap_or_default()
     } else {
         password.unwrap_or_else(|| prompt_password_or_exit(user, host, task_name))
     };
-
     (password, identity_file, certificate_file)
 }
-
 fn build_server_metadata(
     host: &str,
     user: &str,
@@ -96,8 +90,6 @@ fn build_server_metadata(
         max_session_lifetime,
     }
 }
-
-// Root level
 pub fn parse_patch_config_from_cmd(
     host: &str,
     user: &str,
@@ -105,13 +97,11 @@ pub fn parse_patch_config_from_cmd(
     password: Option<String>,
     identity_file: Option<String>,
     certificate_file: Option<String>,
-
     recover: bool,
     local_path: &str,
     remote_upload: &str,
     remote_path: &str,
     remote_backup: &str,
-
     use_sudo: bool,
     use_rsync: bool,
     silent: bool,
@@ -131,7 +121,6 @@ pub fn parse_patch_config_from_cmd(
         host,
         PATCH_TASK_NAME,
     );
-
     PatchCmdConfig {
         server_metadata: build_server_metadata(
             host,
@@ -168,8 +157,6 @@ pub fn parse_patch_config_from_cmd(
         }),
     }
 }
-
-// Root level
 pub fn parse_execute_config_from_cmd(
     host: &str,
     user: &str,
@@ -183,7 +170,6 @@ pub fn parse_execute_config_from_cmd(
     env_name: Vec<String>,
     work_path: Option<String>,
     mode: Option<String>,
-
     use_sudo: bool,
     use_rsync: bool,
     silent: bool,
@@ -203,7 +189,6 @@ pub fn parse_execute_config_from_cmd(
         host,
         EXECUTE_TASK_NAME,
     );
-
     if script.is_empty() && cmds.is_empty() {
         log_error_with_host_direct!(
             user,
@@ -213,14 +198,12 @@ pub fn parse_execute_config_from_cmd(
         );
         exit(1);
     }
-    if let Err(e) = crate::commands::execute::validate_env_extract_pairs(
-        &env_extract_regex,
-        &env_name,
-    ) {
+    if let Err(e) =
+        crate::commands::execute::validate_env_extract_pairs(&env_extract_regex, &env_name)
+    {
         log_error_with_host_direct!(user, host, EXECUTE_TASK_NAME, "{}", e);
         exit(1);
     }
-
     ExecuteCmdConfig {
         server_metadata: build_server_metadata(
             host,
@@ -261,19 +244,18 @@ pub fn parse_execute_config_from_cmd(
         }),
     }
 }
-
-// Root level
-pub fn parse_upload_config_from_cmd(
+pub fn parse_transfer_config_from_cmd(
     host: &str,
     user: &str,
     ssh_port: Option<u16>,
     password: Option<String>,
     identity_file: Option<String>,
     certificate_file: Option<String>,
-    transfer_file: Option<String>,
-    transfers: Vec<String>,
+    upload_mapping: Option<String>,
+    uploads: Vec<String>,
+    download_mapping: Option<String>,
+    downloads: Vec<String>,
     patch_envs: Vec<String>,
-
     use_sudo: bool,
     use_rsync: bool,
     silent: bool,
@@ -283,7 +265,7 @@ pub fn parse_upload_config_from_cmd(
     session_acquire_timeout: Option<Duration>,
     max_session_lifetime: Option<Duration>,
     vars: &HashMap<String, String>,
-) -> UploadCmdConfig {
+) -> TransferCmdConfig {
     let ssh_port = ssh_port.unwrap_or(DEFAULT_SSH_PORT);
     let (password, identity_file, certificate_file) = resolve_auth(
         password,
@@ -291,24 +273,29 @@ pub fn parse_upload_config_from_cmd(
         certificate_file,
         user,
         host,
-        UPLOAD_TASK_NAME,
+        TRANSFER_TASK_NAME,
     );
-    if transfer_file.is_none() && transfers.is_empty() && patch_envs.is_empty() {
+    let has_upload = upload_mapping.is_some() || !uploads.is_empty();
+    let has_download = download_mapping.is_some() || !downloads.is_empty();
+    if !has_upload && !has_download {
         log_error_with_host_direct!(
             user,
             host,
-            UPLOAD_TASK_NAME,
-            "Provide at least one of --transfer, --transfer-file, or --patch-env"
+            TRANSFER_TASK_NAME,
+            "Provide at least one of --upload or --download"
         );
         exit(1);
     }
-    let transfer_file = transfer_file.map(|f| {
-        substitute_vars(&f, vars).unwrap_or_else(|e| {
-            log_error_with_host_direct!(user, host, UPLOAD_TASK_NAME, "{}", e);
-            exit(1);
-        })
-    });
-    UploadCmdConfig {
+    if !patch_envs.is_empty() && !has_upload {
+        log_error_with_host_direct!(
+            user,
+            host,
+            TRANSFER_TASK_NAME,
+            "--patch-env can only be used with upload mappings"
+        );
+        exit(1);
+    }
+    TransferCmdConfig {
         server_metadata: build_server_metadata(
             host,
             user,
@@ -325,12 +312,23 @@ pub fn parse_upload_config_from_cmd(
         use_sudo,
         use_rsync,
         silent,
-        transfer_file,
-        transfers,
+        upload_mapping: upload_mapping.map(|f| {
+            substitute_vars(&f, vars).unwrap_or_else(|e| {
+                log_error_with_host_direct!(user, host, TRANSFER_TASK_NAME, "{}", e);
+                exit(1);
+            })
+        }),
+        uploads,
+        download_mapping: download_mapping.map(|f| {
+            substitute_vars(&f, vars).unwrap_or_else(|e| {
+                log_error_with_host_direct!(user, host, TRANSFER_TASK_NAME, "{}", e);
+                exit(1);
+            })
+        }),
+        downloads,
         patch_envs,
     }
 }
-
 fn server_metadata_from_yml(
     server: &ServerConfig,
     common: &Option<crate::domain::yml_config::CommonConfig>,
@@ -374,14 +372,11 @@ fn server_metadata_from_yml(
             .unwrap_or(DEFAULT_MAX_SESSION_LIFETIME),
     )
 }
-
-/// One ordered pipeline step expanded to per-server command configs.
 pub enum ParsedRunStep {
-    Upload(Vec<(UploadCmdConfig, HashMap<String, String>)>),
+    Transfer(Vec<(TransferCmdConfig, HashMap<String, String>)>),
     Execute(Vec<(ExecuteCmdConfig, HashMap<String, String>)>),
     Patch(Vec<(PatchCmdConfig, HashMap<String, String>)>),
 }
-
 fn merge_var_maps(
     global: &HashMap<String, String>,
     config: &HashMap<String, String>,
@@ -392,7 +387,6 @@ fn merge_var_maps(
     }
     merged
 }
-
 fn effective_targets<'a>(
     named_config: &'a NamedConfig,
     step_servers: &'a [String],
@@ -410,8 +404,6 @@ fn effective_targets<'a>(
     };
     (servers, groups)
 }
-
-/// Parse `runs:` into ordered steps. Servers within a step run in parallel; steps stay sequential.
 pub fn parse_run_steps(
     named_config: &NamedConfig,
     yml_config: &YmlConfig,
@@ -420,33 +412,31 @@ pub fn parse_run_steps(
 ) -> Vec<ParsedRunStep> {
     if named_config.runs.is_empty() {
         log_error_direct!(
-            "Config '{}' has no runs. Add ordered upload/execute/patch steps under `runs:`.",
+            "Config '{}' has no runs. Add ordered transfer/execute/patch steps under `runs:`.",
             named_config.name
         );
         exit(1);
     }
-
     let var_map = merge_var_maps(&yml_config.var_map, &named_config.var_map);
     let common = &yml_config.common;
     let mut steps = Vec::with_capacity(named_config.runs.len());
-
     for (idx, run) in named_config.runs.iter().enumerate() {
         let step_no = idx + 1;
         match run {
-            RunStep::Upload(upload) => {
+            RunStep::Transfer(transfer) => {
                 let servers = collect_servers_for_step(
                     server_config_map,
                     yml_config,
                     failed_servers,
                     named_config,
-                    &upload.target_servers,
-                    &upload.target_groups,
-                    UPLOAD_TASK_NAME,
+                    &transfer.target_servers,
+                    &transfer.target_groups,
+                    TRANSFER_TASK_NAME,
                     step_no,
                 );
-                steps.push(ParsedRunStep::Upload(build_upload_step_configs(
+                steps.push(ParsedRunStep::Transfer(build_transfer_step_configs(
                     named_config,
-                    upload,
+                    transfer,
                     &servers,
                     common,
                     &var_map,
@@ -492,53 +482,81 @@ pub fn parse_run_steps(
             }
         }
     }
-
     steps
 }
-
-fn build_upload_step_configs(
+fn build_transfer_step_configs(
     named_config: &NamedConfig,
-    upload: &UploadStep,
+    transfer: &TransferStep,
     servers: &[ServerConfig],
     common: &Option<crate::domain::yml_config::CommonConfig>,
     var_map: &HashMap<String, String>,
-) -> Vec<(UploadCmdConfig, HashMap<String, String>)> {
+) -> Vec<(TransferCmdConfig, HashMap<String, String>)> {
     let mut configs = Vec::new();
     for server in servers {
-        if upload.transfer_file.is_none()
-            && upload.transfers.is_empty()
-            && upload.patch_envs.is_empty()
-        {
+        let has_upload = transfer.upload_mapping.is_some() || !transfer.uploads.is_empty();
+        let has_download = transfer.download_mapping.is_some() || !transfer.downloads.is_empty();
+        if !has_upload && !has_download {
             log_error_with_host_direct!(
                 &server.user,
                 &server.host,
-                UPLOAD_TASK_NAME,
-                "Upload step requires transfer-file, transfers, and/or patch-envs"
+                TRANSFER_TASK_NAME,
+                "Transfer step requires upload and/or download mappings"
             );
             exit(1);
         }
-        let transfer_file = upload.transfer_file.as_ref().map(|f| {
+        if !transfer.patch_envs.is_empty() && !has_upload {
+            log_error_with_host_direct!(
+                &server.user,
+                &server.host,
+                TRANSFER_TASK_NAME,
+                "--patch-env can only be used with upload mappings"
+            );
+            exit(1);
+        }
+        let upload_mapping = transfer.upload_mapping.as_ref().map(|f| {
             substitute_vars(f, var_map).unwrap_or_else(|e| {
-                log_error_with_host_direct!(&server.user, &server.host, UPLOAD_TASK_NAME, "{}", e);
+                log_error_with_host_direct!(
+                    &server.user,
+                    &server.host,
+                    TRANSFER_TASK_NAME,
+                    "{}",
+                    e
+                );
+                exit(1);
+            })
+        });
+        let download_mapping = transfer.download_mapping.as_ref().map(|f| {
+            substitute_vars(f, var_map).unwrap_or_else(|e| {
+                log_error_with_host_direct!(
+                    &server.user,
+                    &server.host,
+                    TRANSFER_TASK_NAME,
+                    "{}",
+                    e
+                );
                 exit(1);
             })
         });
         configs.push((
-            UploadCmdConfig {
-                server_metadata: server_metadata_from_yml(server, common, UPLOAD_TASK_NAME),
-                use_sudo: upload.use_sudo.or(named_config.use_sudo).unwrap_or(false),
-                use_rsync: upload.use_rsync.or(named_config.use_rsync).unwrap_or(false),
-                silent: upload.silent.or(named_config.silent).unwrap_or(false),
-                transfer_file,
-                transfers: upload.transfers.clone(),
-                patch_envs: upload.patch_envs.clone(),
+            TransferCmdConfig {
+                server_metadata: server_metadata_from_yml(server, common, TRANSFER_TASK_NAME),
+                use_sudo: transfer.use_sudo.or(named_config.use_sudo).unwrap_or(false),
+                use_rsync: transfer
+                    .use_rsync
+                    .or(named_config.use_rsync)
+                    .unwrap_or(false),
+                silent: transfer.silent.or(named_config.silent).unwrap_or(false),
+                upload_mapping,
+                uploads: transfer.uploads.clone(),
+                download_mapping,
+                downloads: transfer.downloads.clone(),
+                patch_envs: transfer.patch_envs.clone(),
             },
             var_map.clone(),
         ));
     }
     configs
 }
-
 fn build_execute_step_configs(
     named_config: &NamedConfig,
     execute: &ExecuteStep,
@@ -560,7 +578,6 @@ fn build_execute_step_configs(
         log_error_direct!("Execute step in config '{}': {}", named_config.name, e);
         exit(1);
     }
-
     let mut configs = Vec::new();
     for server in servers {
         configs.push((
@@ -619,7 +636,6 @@ fn build_execute_step_configs(
     }
     configs
 }
-
 fn build_patch_step_configs(
     named_config: &NamedConfig,
     patch: &PatchStep,
@@ -637,19 +653,43 @@ fn build_patch_step_configs(
                 silent: patch.silent.or(named_config.silent).unwrap_or(false),
                 recover: patch.recover,
                 local_path: substitute_vars(&patch.local_path, var_map).unwrap_or_else(|e| {
-                    log_error_with_host_direct!(&server.user, &server.host, PATCH_TASK_NAME, "{}", e);
+                    log_error_with_host_direct!(
+                        &server.user,
+                        &server.host,
+                        PATCH_TASK_NAME,
+                        "{}",
+                        e
+                    );
                     exit(1);
                 }),
                 remote_upload: substitute_vars(&patch.remote_upload, var_map).unwrap_or_else(|e| {
-                    log_error_with_host_direct!(&server.user, &server.host, PATCH_TASK_NAME, "{}", e);
+                    log_error_with_host_direct!(
+                        &server.user,
+                        &server.host,
+                        PATCH_TASK_NAME,
+                        "{}",
+                        e
+                    );
                     exit(1);
                 }),
                 remote_path: substitute_vars(&patch.remote_path, var_map).unwrap_or_else(|e| {
-                    log_error_with_host_direct!(&server.user, &server.host, PATCH_TASK_NAME, "{}", e);
+                    log_error_with_host_direct!(
+                        &server.user,
+                        &server.host,
+                        PATCH_TASK_NAME,
+                        "{}",
+                        e
+                    );
                     exit(1);
                 }),
                 remote_backup: substitute_vars(&patch.remote_backup, var_map).unwrap_or_else(|e| {
-                    log_error_with_host_direct!(&server.user, &server.host, PATCH_TASK_NAME, "{}", e);
+                    log_error_with_host_direct!(
+                        &server.user,
+                        &server.host,
+                        PATCH_TASK_NAME,
+                        "{}",
+                        e
+                    );
                     exit(1);
                 }),
             },
@@ -658,7 +698,6 @@ fn build_patch_step_configs(
     }
     configs
 }
-
 fn collect_servers_for_step(
     server_map: &HashMap<String, ServerConfig>,
     yml_config: &YmlConfig,
@@ -671,7 +710,6 @@ fn collect_servers_for_step(
 ) -> Vec<ServerConfig> {
     let (target_servers, target_groups) =
         effective_targets(named_config, step_servers, step_groups);
-
     if target_servers.is_empty() && target_groups.is_empty() {
         log_error_direct!(
             "Config '{}' step {} ({}) has no target-servers or target-groups",
@@ -681,9 +719,7 @@ fn collect_servers_for_step(
         );
         exit(1);
     }
-
     let mut servers: HashSet<ServerConfig> = HashSet::new();
-
     for server_name in target_servers {
         if failed_servers.contains(server_name) {
             log_warn_root!(
@@ -705,7 +741,6 @@ fn collect_servers_for_step(
             }
         }
     }
-
     if let Some(group_map) = &yml_config.group_map {
         for group_name in target_groups {
             match group_map.get(group_name) {
@@ -743,7 +778,6 @@ fn collect_servers_for_step(
             }
         }
     }
-
     if servers.is_empty() {
         log_error_direct!(
             "Config '{}' step {} ({}) resolved to no reachable servers",
@@ -753,6 +787,5 @@ fn collect_servers_for_step(
         );
         exit(1);
     }
-
     servers.into_iter().collect()
 }

@@ -26,15 +26,16 @@ mod utils;
 use crate::common::ssh_pool::ServerPool;
 use crate::domain::constants::{
     DEFAULT_EXECUTE_MODE, DEFAULT_EXECUTE_WORK_PATH, DEFAULT_SSH_PORT, EXECUTE_TASK_NAME,
-    PATCH_TASK_NAME, UPLOAD_TASK_NAME,
+    PATCH_TASK_NAME, TRANSFER_TASK_NAME,
 };
 use crate::domain::yml_config::ServerConfig;
 use crate::handlers::command_handler::{
     parse_execute_config_from_cmd, parse_patch_config_from_cmd, parse_run_steps,
-    parse_upload_config_from_cmd, ParsedRunStep,
+    parse_transfer_config_from_cmd, ParsedRunStep,
 };
 use crate::utils::file_utils::{
-    load_yaml_config, resolve_patch_env_mappings, resolve_upload_mappings,
+    load_yaml_config, resolve_download_mappings, resolve_patch_env_mappings,
+    resolve_upload_mappings,
 };
 use crate::utils::log_utils::{ask_user_and_abort_option, flush_logs_and_exit, init_logger};
 
@@ -61,53 +62,50 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    #[command(about = "Upload files or directories using transfer mappings")]
-    Upload {
+    #[command(about = "Upload and download files or directories using transfer mappings")]
+    Transfer {
         #[arg(long, help = "Remote host IP or hostname")]
         host: String,
-
         #[arg(long, help = "Remote SSH port")]
         ssh_port: Option<u16>,
-
         #[arg(long, help = "Remote username")]
         user: String,
-
-        #[arg(long, help = "Remote password (optional when --identity is set; also used for sudo)")]
+        #[arg(
+            long,
+            help = "Remote password (optional when --identity is set; also used for sudo)"
+        )]
         password: Option<String>,
-
         #[arg(
             long,
             help = "Path to SSH private key (identity file). Preferred over password when set."
         )]
         identity: Option<String>,
-
-        #[arg(
-            long,
-            help = "Path to OpenSSH certificate (requires --identity)"
-        )]
+        #[arg(long, help = "Path to OpenSSH certificate (requires --identity)")]
         certificate: Option<String>,
-
+        #[arg(long = "upload", help = "Upload mapping local=remote-dir (repeatable)")]
+        upload: Vec<String>,
         #[arg(
-            long = "transfer",
-            help = "Inline transfer mapping local=remote-dir (repeatable). Overrides the same local path from --transfer-file."
+            long = "download",
+            help = "Download mapping remote=local-dir (repeatable)"
         )]
-        transfer: Vec<String>,
-
+        download: Vec<String>,
         #[arg(
-            long = "transfer-file",
-            help = "Transfer file with local=remote-dir lines (same format as --transfer)"
+            long = "upload-mapping",
+            help = "Upload mapping file with local=remote-dir lines"
         )]
-        transfer_file: Option<String>,
-
+        upload_mapping: Option<String>,
+        #[arg(
+            long = "download-mapping",
+            help = "Download mapping file with remote=local-dir lines"
+        )]
+        download_mapping: Option<String>,
         #[arg(
             long = "patch-env",
-            help = "Merge local .env into remote .env (local=remote-file). Local keys overwrite; remote-only keys kept. Repeatable."
+            help = "Merge local .env into remote .env (upload only). Repeatable."
         )]
         patch_env: Vec<String>,
-
         #[arg(long, default_value = "false", help = "Use sudo for operations")]
         use_sudo: bool,
-
         #[arg(
             long,
             default_value = "false",
@@ -199,10 +197,10 @@ enum Commands {
         env_name: Vec<String>,
 
         #[arg(
-            long,
-            default_value = DEFAULT_EXECUTE_WORK_PATH,
-            help = "Remote working directory where the bash script will be executed (defaults to the user's home directory: ~)"
-        )]
+ long,
+ default_value = DEFAULT_EXECUTE_WORK_PATH,
+ help = "Remote working directory where the bash script will be executed (defaults to the user's home directory: ~)"
+ )]
         work_path: Option<String>,
 
         #[arg(long, default_value = DEFAULT_EXECUTE_MODE, help = "Execution mode: 'sync' (run sequentially) or 'async' (run concurrently)")]
@@ -256,20 +254,17 @@ enum Commands {
 
         #[arg(long, help = "Remote username")]
         user: String,
-
-        #[arg(long, help = "Remote password (optional when --identity is set; also used for sudo)")]
+        #[arg(
+            long,
+            help = "Remote password (optional when --identity is set; also used for sudo)"
+        )]
         password: Option<String>,
-
         #[arg(
             long,
             help = "Path to SSH private key (identity file). Preferred over password when set."
         )]
         identity: Option<String>,
-
-        #[arg(
-            long,
-            help = "Path to OpenSSH certificate (requires --identity)"
-        )]
+        #[arg(long, help = "Path to OpenSSH certificate (requires --identity)")]
         certificate: Option<String>,
 
         #[arg(long, help = "Local source file")]
@@ -358,31 +353,27 @@ async fn main() {
         .filter_module("russh", log::LevelFilter::Info)
         .filter_module("russh_keys", log::LevelFilter::Info)
         .init();
-
     let log_handle: JoinHandle<()> = init_logger().await;
 
     // Thread handles for parallel execution
     let mut tasks: Vec<JoinHandle<()>> = Vec::new();
-
     let global_server_pool = Arc::new(ServerPool::new());
     global_server_pool
         .clone()
         .start_idle_cleanup(Duration::from_secs(10));
-
-    // CLI mode
     match cli.command {
-        Commands::Upload {
+        Commands::Transfer {
             host,
             ssh_port,
             user,
             password,
             identity,
             certificate,
-
-            transfer,
-            transfer_file,
+            upload,
+            download,
+            upload_mapping,
+            download_mapping,
             patch_env,
-
             use_sudo,
             use_rsync,
             silent,
@@ -393,24 +384,17 @@ async fn main() {
             max_session_lifetime,
             ..
         } => {
-            if transfer.is_empty() && transfer_file.is_none() && patch_env.is_empty() {
-                log_error_with_host_direct!(
-                    user.as_str(),
-                    host.as_str(),
-                    UPLOAD_TASK_NAME,
-                    "Provide at least one of --transfer, --transfer-file, or --patch-env"
-                );
-                exit(1);
-            }
-            let config = parse_upload_config_from_cmd(
+            let config = parse_transfer_config_from_cmd(
                 &host,
                 &user,
                 ssh_port,
                 password,
                 identity,
                 certificate,
-                transfer_file,
-                transfer,
+                upload_mapping,
+                upload,
+                download_mapping,
+                download,
                 patch_env,
                 use_sudo,
                 use_rsync,
@@ -422,9 +406,9 @@ async fn main() {
                 max_session_lifetime,
                 &env_vars,
             );
-            let mappings = match resolve_upload_mappings(
-                config.transfer_file.as_deref(),
-                &config.transfers,
+            let uploads = match resolve_upload_mappings(
+                config.upload_mapping.as_deref(),
+                &config.uploads,
                 &env_vars,
             ) {
                 Ok(m) => m,
@@ -432,7 +416,24 @@ async fn main() {
                     log_error_with_host_direct!(
                         user.as_str(),
                         host.as_str(),
-                        UPLOAD_TASK_NAME,
+                        TRANSFER_TASK_NAME,
+                        "{}",
+                        e
+                    );
+                    exit(1);
+                }
+            };
+            let downloads = match resolve_download_mappings(
+                config.download_mapping.as_deref(),
+                &config.downloads,
+                &env_vars,
+            ) {
+                Ok(m) => m,
+                Err(e) => {
+                    log_error_with_host_direct!(
+                        user.as_str(),
+                        host.as_str(),
+                        TRANSFER_TASK_NAME,
                         "{}",
                         e
                     );
@@ -445,7 +446,7 @@ async fn main() {
                     log_error_with_host_direct!(
                         user.as_str(),
                         host.as_str(),
-                        UPLOAD_TASK_NAME,
+                        TRANSFER_TASK_NAME,
                         "{}",
                         e
                     );
@@ -466,7 +467,7 @@ async fn main() {
                     log_error_with_host_direct!(
                         user.as_str(),
                         host.as_str(),
-                        UPLOAD_TASK_NAME,
+                        TRANSFER_TASK_NAME,
                         "{}",
                         format!("Failed to check server connection: \n\t> {}", e)
                     );
@@ -482,21 +483,22 @@ async fn main() {
                 if let Err(e) = global_server_pool_clone
                     .check_global_remote_temp_dir(
                         &server_metadata,
-                        UPLOAD_TASK_NAME,
+                        TRANSFER_TASK_NAME,
                         config.use_sudo,
                         config.silent,
                     )
                     .await
                 {
-                    log_error!(&server_metadata, UPLOAD_TASK_NAME, "{}", e);
+                    log_error!(&server_metadata, TRANSFER_TASK_NAME, "{}", e);
                     if let Err(e) = global_server_pool_clone.cleanup_pending_servers().await {
                         log::error!("Cleanup temp forder failed: \n\t> {}", e);
                     }
                     flush_logs_and_exit(log_handle).await;
                 }
-                let result = commands::upload::run(
+                let result = commands::transfer::run(
                     &config,
-                    &mappings,
+                    &uploads,
+                    &downloads,
                     &patch_envs,
                     &server_metadata,
                     global_server_pool_clone.clone(),
@@ -505,8 +507,8 @@ async fn main() {
                 if let Err(e) = result {
                     log_error!(
                         &server_metadata,
-                        UPLOAD_TASK_NAME,
-                        "Upload failed: \n\t> {}",
+                        TRANSFER_TASK_NAME,
+                        "Transfer failed: \n\t> {}",
                         e
                     );
                     if let Err(e) = global_server_pool_clone.cleanup_pending_servers().await {
@@ -770,12 +772,12 @@ async fn main() {
                 flush_logs_and_exit(log_handle).await;
             } else if !failed_servers.is_empty() {
                 ask_user_and_abort_option(
-                    None,
-                    None,
-                    "There are some servers with failed connection. Continue with remaining servers?",
-                    false,
-                )
-                .await;
+ None,
+ None,
+ "There are some servers with failed connection. Continue with remaining servers?",
+ false,
+ )
+ .await;
                 // yml_config.servers.retain(|s| !failed_servers.iter().any(|f| f.host == s.host && f.ssh_port == s.ssh_port));
             } else if failed_servers.is_empty() {
                 log_info_direct!("All servers are healthy.");
@@ -797,7 +799,7 @@ async fn main() {
             for (idx, step) in run_steps.into_iter().enumerate() {
                 let step_no = idx + 1;
                 let step_kind = match &step {
-                    ParsedRunStep::Upload(_) => "upload",
+                    ParsedRunStep::Transfer(_) => "transfer",
                     ParsedRunStep::Execute(_) => "execute",
                     ParsedRunStep::Patch(_) => "patch",
                 };
@@ -807,16 +809,14 @@ async fn main() {
                     total_steps,
                     step_kind
                 );
-
                 let mut step_tasks: Vec<JoinHandle<Result<(), String>>> = Vec::new();
-
                 match step {
-                    ParsedRunStep::Upload(configs) => {
+                    ParsedRunStep::Transfer(configs) => {
                         for (config, vars) in configs {
                             let server_metadata = Arc::new(config.server_metadata.clone());
-                            let mappings = match resolve_upload_mappings(
-                                config.transfer_file.as_deref(),
-                                &config.transfers,
+                            let uploads = match resolve_upload_mappings(
+                                config.upload_mapping.as_deref(),
+                                &config.uploads,
                                 &vars,
                             ) {
                                 Ok(m) => m,
@@ -825,8 +825,9 @@ async fn main() {
                                     flush_logs_and_exit(log_handle).await;
                                 }
                             };
-                            let patch_envs = match resolve_patch_env_mappings(
-                                &config.patch_envs,
+                            let downloads = match resolve_download_mappings(
+                                config.download_mapping.as_deref(),
+                                &config.downloads,
                                 &vars,
                             ) {
                                 Ok(m) => m,
@@ -835,23 +836,32 @@ async fn main() {
                                     flush_logs_and_exit(log_handle).await;
                                 }
                             };
+                            let patch_envs =
+                                match resolve_patch_env_mappings(&config.patch_envs, &vars) {
+                                    Ok(m) => m,
+                                    Err(e) => {
+                                        log_error_root!("{}", e);
+                                        flush_logs_and_exit(log_handle).await;
+                                    }
+                                };
                             let global_server_pool_clone = global_server_pool.clone();
                             let handle = tokio::spawn(async move {
                                 if let Err(e) = global_server_pool_clone
                                     .check_global_remote_temp_dir(
                                         &server_metadata,
-                                        UPLOAD_TASK_NAME,
+                                        TRANSFER_TASK_NAME,
                                         config.use_sudo,
                                         config.silent,
                                     )
                                     .await
                                 {
-                                    log_error!(&server_metadata, UPLOAD_TASK_NAME, "{}", e);
+                                    log_error!(&server_metadata, TRANSFER_TASK_NAME, "{}", e);
                                     return Err(e);
                                 }
-                                match commands::upload::run(
+                                match commands::transfer::run(
                                     &config,
-                                    &mappings,
+                                    &uploads,
+                                    &downloads,
                                     &patch_envs,
                                     &server_metadata,
                                     global_server_pool_clone.clone(),
@@ -862,8 +872,8 @@ async fn main() {
                                     Err(e) => {
                                         log_error!(
                                             &server_metadata,
-                                            UPLOAD_TASK_NAME,
-                                            "Upload failed: \n\t> {}",
+                                            TRANSFER_TASK_NAME,
+                                            "Transfer failed: \n\t> {}",
                                             e
                                         );
                                         Err(e)

@@ -20,6 +20,7 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
+use dirs_next as dirs;
 
 pub fn load_yaml_config(path: &str) -> Result<YmlConfig, String> {
     let mut file = File::open(path)
@@ -99,33 +100,29 @@ pub fn get_local_path_base_name(path: &Path) -> Result<String, String> {
         .map(|s| s.trim_end().to_string())
         .ok_or_else(|| format!("Could not get base name: {}", path.display()))
 }
-
-pub fn parse_transfer_mapping(raw: &str, vars: &HashMap<String, String>) -> Result<(String, String), String> {
+pub fn parse_mapping(
+    raw: &str,
+    vars: &HashMap<String, String>,
+    expected: &str,
+) -> Result<(String, String), String> {
     let line = raw.trim();
     let parts: Vec<&str> = line.splitn(2, '=').collect();
     if parts.len() != 2 {
-        return Err(format!(
-            "Invalid transfer mapping '{}'; expected local=remote-dir",
-            raw
-        ));
+        return Err(format!("Invalid mapping '{}'; expected {}", raw, expected));
     }
-    let local_file_or_dir = substitute_vars(parts[0].trim(), vars)?;
-    let target_path = substitute_vars(parts[1].trim(), vars)?;
-    if local_file_or_dir.is_empty() || target_path.is_empty() {
-        return Err(format!(
-            "Empty local or target path in transfer mapping '{}'",
-            raw
-        ));
+    let source = substitute_vars(parts[0].trim(), vars)?;
+    let target = substitute_vars(parts[1].trim(), vars)?;
+    if source.is_empty() || target.is_empty() {
+        return Err(format!("Empty source or target path in mapping '{}'", raw));
     }
-    Ok((local_file_or_dir, target_path))
+    Ok((source, target))
 }
-
-pub fn load_properties(
+pub fn load_mapping_file(
     file: &str,
     mappings: &mut HashMap<String, String>,
     vars: &HashMap<String, String>,
+    expected: &str,
 ) -> Result<(), String> {
-    // println!("vars: {:?}", vars);
     let file = substitute_vars(file, vars)?;
     let f = File::open(&file).map_err(|e| format!("Error opening file '{}'. \n\t> {}", file, e))?;
     for (line_num, line) in BufReader::new(f).lines().enumerate() {
@@ -134,33 +131,44 @@ pub fn load_properties(
         if line.trim().is_empty() || line.starts_with('#') {
             continue;
         }
-        let (local_file_or_dir, target_path) = parse_transfer_mapping(line, vars).map_err(|e| {
-            format!("Invalid format at line {}: {}", line_num + 1, e)
-        })?;
+        let (local_file_or_dir, target_path) = parse_mapping(line, vars, expected)
+            .map_err(|e| format!("Invalid format at line {}: {}", line_num + 1, e))?;
         mappings.insert(local_file_or_dir, target_path);
     }
     Ok(())
 }
-
-/// Build upload mappings: transfer-file first, then inline `--transfer` (overrides same local path).
-/// Returns an empty map when neither source is set (caller may rely on `--patch-env` alone).
 pub fn resolve_upload_mappings(
-    transfer_file: Option<&str>,
-    transfers: &[String],
+    upload_mapping: Option<&str>,
+    uploads: &[String],
     vars: &HashMap<String, String>,
 ) -> Result<HashMap<String, String>, String> {
     let mut mappings = HashMap::new();
-    if let Some(file) = transfer_file {
-        load_properties(file, &mut mappings, vars)?;
+    if let Some(file) = upload_mapping {
+        load_mapping_file(file, &mut mappings, vars, "local=remote-dir")?;
     }
-    for raw in transfers {
-        let (local, remote) = parse_transfer_mapping(raw, vars)?;
+    for raw in uploads {
+        let (local, remote) = parse_mapping(raw, vars, "local=remote-dir")?;
         mappings.insert(local, remote);
     }
     Ok(mappings)
 }
 
-/// Resolve `--patch-env local=remote` mappings (order preserved; later overrides same local path).
+pub fn resolve_download_mappings(
+    download_mapping: Option<&str>,
+    downloads: &[String],
+    vars: &HashMap<String, String>,
+) -> Result<HashMap<String, String>, String> {
+    let mut mappings = HashMap::new();
+    if let Some(file) = download_mapping {
+        load_mapping_file(file, &mut mappings, vars, "remote=local-dir")?;
+    }
+    for raw in downloads {
+        let (remote, local) = parse_mapping(raw, vars, "remote=local-dir")?;
+        mappings.insert(remote, local);
+    }
+    Ok(mappings)
+}
+
 pub fn resolve_patch_env_mappings(
     patch_envs: &[String],
     vars: &HashMap<String, String>,
@@ -168,9 +176,7 @@ pub fn resolve_patch_env_mappings(
     let mut out = Vec::new();
     let mut by_local: HashMap<String, usize> = HashMap::new();
     for raw in patch_envs {
-        let (local, remote) = parse_transfer_mapping(raw, vars).map_err(|e| {
-            e.replace("remote-dir", "remote-env-file")
-        })?;
+        let (local, remote) = parse_mapping(raw, vars, "local=remote-env-file")?;
         if let Some(idx) = by_local.get(&local).copied() {
             out[idx] = (local.clone(), remote);
         } else {
@@ -206,12 +212,12 @@ pub fn parse_env_file_contents(text: &str) -> Result<Vec<(String, String)>, Stri
                 .chars()
                 .enumerate()
                 .all(|(j, c)| {
-                    if j == 0 {
-                        c.is_ascii_alphabetic() || c == '_'
-                    } else {
-                        c.is_ascii_alphanumeric() || c == '_'
-                    }
-                })
+                if j == 0 {
+                    c.is_ascii_alphabetic() || c == '_'
+                } else {
+                    c.is_ascii_alphanumeric() || c == '_'
+                }
+            })
         {
             return Err(format!(
                 "Invalid .env key on line {}: '{}'",
@@ -305,10 +311,7 @@ pub fn expand_vars(input: &str, overlays: &HashMap<String, String>) -> Result<St
             }
             rest = &rest[end + 1..];
         } else {
-            return Err(format!(
-                "Unclosed variable placeholder in '{}'",
-                input
-            ));
+            return Err(format!("Unclosed variable placeholder in '{}'", input));
         }
     }
 
@@ -335,6 +338,21 @@ pub fn substitute_vars(input_path: &str, vars: &HashMap<String, String>) -> Resu
     Ok(result)
 }
 
+/// Expand a leading `~/` to the user's home directory.
+pub fn expand_local_user_path(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest).to_string_lossy().into_owned();
+        }
+    } else if path == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return home.to_string_lossy().into_owned();
+        }
+    }
+    path.to_string()
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,7 +360,7 @@ mod tests {
     #[test]
     fn parse_transfer_mapping_ok() {
         let vars = HashMap::new();
-        let (l, r) = parse_transfer_mapping("a/b.txt=~/out", &vars).unwrap();
+        let (l, r) = parse_mapping("a/b.txt=~/out", &vars, "local=remote-dir").unwrap();
         assert_eq!(l, "a/b.txt");
         assert_eq!(r, "~/out");
     }
@@ -357,11 +375,17 @@ mod tests {
     #[test]
     fn resolve_upload_inline_only() {
         let vars = HashMap::new();
-        let transfers = vec!["local.txt=~/remote".to_string()];
-        let m = resolve_upload_mappings(None, &transfers, &vars).unwrap();
+        let uploads = vec!["local.txt=~/remote".to_string()];
+        let m = resolve_upload_mappings(None, &uploads, &vars).unwrap();
         assert_eq!(m.get("local.txt").map(String::as_str), Some("~/remote"));
     }
-
+    #[test]
+    fn resolve_download_inline_only() {
+        let vars = HashMap::new();
+        let downloads = vec!["/remote/app=./backup".to_string()];
+        let m = resolve_download_mappings(None, &downloads, &vars).unwrap();
+        assert_eq!(m.get("/remote/app").map(String::as_str), Some("./backup"));
+    }
     #[test]
     fn merge_env_keeps_remote_only_and_overwrites() {
         let remote = vec![
@@ -393,3 +417,7 @@ mod tests {
         );
     }
 }
+
+
+
+
