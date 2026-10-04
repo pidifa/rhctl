@@ -20,17 +20,12 @@
 
 set -e
 
-echo "[INFO] Checking and syncing system time..."
-if ! command -v ntpdate >/dev/null 2>&1; then
-  sudo apt-get update -y || true
-  sudo apt-get install -y ntpdate
-  echo "[INFO] ntpdate installed successfully."
-fi
+echo "[INFO] Checking system time synchronization..."
 
-if sudo ntpdate -u time.google.com; then
-  echo "[INFO] Time sync successful."
+if timedatectl status 2>/dev/null | grep -q "System clock synchronized: yes"; then
+    echo "[INFO] System clock is synchronized."
 else
-  echo "[WARN] Time sync failed. Continuing with existing system time."
+    echo "[WARN] System clock is not synchronized. Continuing."
 fi
 
 echo "[INFO] Updating package index..."
