@@ -64,6 +64,9 @@ pub struct UploadStep {
     /// Inline transfers (`local=remote-dir`).
     #[serde(default)]
     pub transfers: Vec<String>,
+    /// Merge local `.env` into remote file (`local=remote-file`).
+    #[serde(default)]
+    pub patch_envs: Vec<String>,
 
     #[serde(default)]
     pub target_servers: Vec<String>,

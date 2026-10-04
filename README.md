@@ -173,7 +173,7 @@ echo "Remote Execution 1.2"
 
 ## rhctl upload
 [Back to Top](#table-of-contents)  
-Upload multiple files or all contents of a directory to a remote directory in parallel, using inline `--transfer` pairs and/or a `--transfer-file`.
+Upload files/directories with `--transfer` / `--transfer-file`, and/or merge `.env` files with `--patch-env`.
 
 ![](./docs/assets/cmd/upload.svg) 
 
@@ -188,6 +188,7 @@ rhctl upload \
   [--certificate <cert>] \
   [--transfer <local=remote-dir> ...] \
   [--transfer-file <file>] \
+  [--patch-env <local=.env=remote-.env> ...] \
   [options]
 ```
 
@@ -202,8 +203,13 @@ Maps local files or directories to target directories on the remote server.
 
 Note: The right-hand side must be a **directory**, not a file path. If it does not exist, it will be created automatically.  
 Note: The file or the contents of the local directory on the left will be uploaded **into** the specified remote directory on the right.  
-Note: Provide at least one of `--transfer` or `--transfer-file`. When both are set, the file is loaded first and `--transfer` overrides the same local path.
+Note: Provide at least one of `--transfer`, `--transfer-file`, or `--patch-env`. When `--transfer` and `--transfer-file` are both set, the file is loaded first and `--transfer` overrides the same local path.
 
+**Patch-env Format** (`--patch-env`):
+```text
+/local/app.env=/etc/rhctl/.env
+```
+Merges local keys into the remote `.env`: local keys overwrite; remote-only keys are kept. Creates the remote file if missing; `chmod 600` (and `700` on `/etc/rhctl` when applicable). Skips blanks and `#` comments.
 
 **Example** (transfer file):
 ```bash
@@ -222,12 +228,22 @@ rhctl upload \
   --transfer assets/exampledir=~/examples/targetdir
 ```
 
+**Example** (patch env):
+```bash
+rhctl upload \
+  --host 192.168.75.128 \
+  --user root \
+  --patch-env /local/app.env=/etc/rhctl/.env \
+  --use-sudo
+```
+
 **Required Parameters**:
 - `--host <ip/hostname>`: Remote host IP or hostname
 - `--user <username>`: Remote username
 - At least one of:
   - `--transfer <local=remote-dir>`: Inline mapping (repeatable)
   - `--transfer-file <path>`: File of `local=remote-dir` lines
+  - `--patch-env <local=.env=remote-.env>`: Merge local `.env` into remote (repeatable)
 
 **Optional Parameters**:
 - `--password <password>`: Remote password (optional when `--identity` is set; also used for sudo and as a private-key passphrase fallback)
@@ -398,6 +414,8 @@ configs:
         # transfer-file: "config/path-mapping.properties"
         transfers:
           - "${ASSETS_ROOT}/example1.txt=~/examples"
+        # patch-envs:
+        #   - "${ASSETS_ROOT}/app.env=/etc/rhctl/.env"
         # Optional per-step target override:
         # target-servers: ["test-server1"]
 

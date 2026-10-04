@@ -29,6 +29,9 @@ pub struct UploadCmdConfig {
     /// Inline transfers (`local=remote-dir`); applied after the file (override same local path).
     #[serde(default)]
     pub transfers: Vec<String>,
+    /// Merge local `.env` into remote `.env` (`local=remote-file`). Local keys overwrite; remote-only keys kept.
+    #[serde(default)]
+    pub patch_envs: Vec<String>,
 }
 
 /// One local script to run remotely: path plus optional CLI args.

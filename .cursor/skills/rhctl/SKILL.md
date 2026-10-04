@@ -91,7 +91,7 @@ Path placeholders `${NAME}` expand from the process environment.
 
 ### rhctl upload
 
-Upload files/directories to a remote directory via `--transfer` and/or `--transfer-file`.
+Upload files/directories via `--transfer` / `--transfer-file`, and/or merge `.env` files via `--patch-env`.
 
 ```bash
 rhctl upload \
@@ -99,22 +99,26 @@ rhctl upload \
   --user <user> \
   [--transfer <local=remote-dir> ...] \
   [--transfer-file <file>] \
+  [--patch-env <local=.env=remote-.env> ...] \
   [options]
 ```
 
-Transfer format: `<local-path>=<remote-directory>` (RHS is a directory; created if missing). At least one of `--transfer` / `--transfer-file` required. When both set, file loads first; `--transfer` overrides the same local path.
+Transfer format: `<local-path>=<remote-directory>` (RHS is a directory; created if missing).  
+Patch-env format: `<local-.env>=<remote-.env>` — local keys overwrite; remote-only keys kept; `chmod 600`.
+
+At least one of `--transfer` / `--transfer-file` / `--patch-env` required.
 
 ```bash
 rhctl upload \
   --host 192.168.75.128 \
-  --user test99 \
-  --transfer assets/example1.txt=~/examples \
-  --transfer assets/exampledir=~/examples/targetdir
+  --user root \
+  --patch-env /local/app.env=/etc/rhctl/.env \
+  --use-sudo
 ```
 
 **Required Parameters**:
 - `--host`, `--user`
-- At least one of `--transfer <local=remote-dir>` (repeatable) or `--transfer-file <path>`
+- At least one of `--transfer`, `--transfer-file`, or `--patch-env`
 
 **Optional Parameters**: Same SSH / sudo / rsync / silent / timeout / session / `--debug` options as `execute`.
 
@@ -157,7 +161,7 @@ rhctl run --config <yml-file-path> --config-name <name>
 - `--config <yml-file-path>`
 - `--config-name <name>`
 
-Config shape: config-level `target-servers` / `var-map`, ordered `runs:` with `type: upload|execute|patch`. Execute accepts `work-path` (alias `remote-path`).
+Config shape: config-level `target-servers` / `var-map`, ordered `runs:` with `type: upload|execute|patch`. Upload accepts `transfers` / `transfer-file` / `patch-envs`. Execute accepts `work-path` (alias `remote-path`).
 
 For full YAML field details, read `README.md` (`rhctl run` section).
 

@@ -143,17 +143,12 @@ pub fn load_properties(
 }
 
 /// Build upload mappings: transfer-file first, then inline `--transfer` (overrides same local path).
+/// Returns an empty map when neither source is set (caller may rely on `--patch-env` alone).
 pub fn resolve_upload_mappings(
     transfer_file: Option<&str>,
     transfers: &[String],
     vars: &HashMap<String, String>,
 ) -> Result<HashMap<String, String>, String> {
-    if transfer_file.is_none() && transfers.is_empty() {
-        return Err(
-            "Provide at least one of --transfer / transfer-file (or YAML transfers / transfer-file)"
-                .to_string(),
-        );
-    }
     let mut mappings = HashMap::new();
     if let Some(file) = transfer_file {
         load_properties(file, &mut mappings, vars)?;
@@ -162,10 +157,121 @@ pub fn resolve_upload_mappings(
         let (local, remote) = parse_transfer_mapping(raw, vars)?;
         mappings.insert(local, remote);
     }
-    if mappings.is_empty() {
-        return Err("No upload transfers resolved (file and --transfer were empty)".to_string());
-    }
     Ok(mappings)
+}
+
+/// Resolve `--patch-env local=remote` mappings (order preserved; later overrides same local path).
+pub fn resolve_patch_env_mappings(
+    patch_envs: &[String],
+    vars: &HashMap<String, String>,
+) -> Result<Vec<(String, String)>, String> {
+    let mut out = Vec::new();
+    let mut by_local: HashMap<String, usize> = HashMap::new();
+    for raw in patch_envs {
+        let (local, remote) = parse_transfer_mapping(raw, vars).map_err(|e| {
+            e.replace("remote-dir", "remote-env-file")
+        })?;
+        if let Some(idx) = by_local.get(&local).copied() {
+            out[idx] = (local.clone(), remote);
+        } else {
+            by_local.insert(local.clone(), out.len());
+            out.push((local, remote));
+        }
+    }
+    Ok(out)
+}
+
+/// Parse `.env` text into ordered (key, value) pairs. Skips blanks and `#` comments.
+/// `export KEY=...` is accepted. First `=` separates key/value. Later duplicate keys win.
+pub fn parse_env_file_contents(text: &str) -> Result<Vec<(String, String)>, String> {
+    let mut order: Vec<String> = Vec::new();
+    let mut map: HashMap<String, String> = HashMap::new();
+
+    for (i, raw) in text.lines().enumerate() {
+        let line = raw.trim_end_matches('\r').trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line).trim();
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(format!(
+                "Invalid .env line {}: expected KEY=VALUE, got '{}'",
+                i + 1,
+                raw
+            ));
+        };
+        let key = key.trim();
+        if key.is_empty()
+            || !key
+                .chars()
+                .enumerate()
+                .all(|(j, c)| {
+                    if j == 0 {
+                        c.is_ascii_alphabetic() || c == '_'
+                    } else {
+                        c.is_ascii_alphanumeric() || c == '_'
+                    }
+                })
+        {
+            return Err(format!(
+                "Invalid .env key on line {}: '{}'",
+                i + 1,
+                key
+            ));
+        }
+        if !map.contains_key(key) {
+            order.push(key.to_string());
+        }
+        map.insert(key.to_string(), value.to_string());
+    }
+
+    Ok(order
+        .into_iter()
+        .filter_map(|k| map.remove(&k).map(|v| (k, v)))
+        .collect())
+}
+
+/// Merge local env over remote: remote-only keys kept; local keys overwrite; new local keys appended.
+pub fn merge_env_entries(
+    remote: &[(String, String)],
+    local: &[(String, String)],
+) -> Vec<(String, String)> {
+    let local_map: HashMap<&str, &str> = local
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let mut seen: HashMap<String, ()> = HashMap::new();
+    let mut out = Vec::new();
+
+    for (k, v) in remote {
+        let value = local_map.get(k.as_str()).copied().unwrap_or(v.as_str());
+        out.push((k.clone(), value.to_string()));
+        seen.insert(k.clone(), ());
+    }
+    for (k, v) in local {
+        if seen.contains_key(k) {
+            continue;
+        }
+        out.push((k.clone(), v.clone()));
+    }
+    out
+}
+
+pub fn format_env_file(entries: &[(String, String)]) -> String {
+    let mut s = String::new();
+    for (k, v) in entries {
+        s.push_str(k);
+        s.push('=');
+        s.push_str(v);
+        s.push('\n');
+    }
+    s
+}
+
+pub fn load_local_env_file(path: &str) -> Result<Vec<(String, String)>, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read local env file '{}': {}", path, e))?;
+    parse_env_file_contents(&text)
 }
 
 pub fn expand_vars(input: &str, overlays: &HashMap<String, String>) -> Result<String, String> {
@@ -242,9 +348,10 @@ mod tests {
     }
 
     #[test]
-    fn resolve_upload_requires_source() {
+    fn resolve_upload_allows_empty() {
         let vars = HashMap::new();
-        assert!(resolve_upload_mappings(None, &[], &vars).is_err());
+        let m = resolve_upload_mappings(None, &[], &vars).unwrap();
+        assert!(m.is_empty());
     }
 
     #[test]
@@ -253,5 +360,36 @@ mod tests {
         let transfers = vec!["local.txt=~/remote".to_string()];
         let m = resolve_upload_mappings(None, &transfers, &vars).unwrap();
         assert_eq!(m.get("local.txt").map(String::as_str), Some("~/remote"));
+    }
+
+    #[test]
+    fn merge_env_keeps_remote_only_and_overwrites() {
+        let remote = vec![
+            ("A".into(), "1".into()),
+            ("B".into(), "2".into()),
+        ];
+        let local = vec![
+            ("B".into(), "9".into()),
+            ("C".into(), "3".into()),
+        ];
+        let merged = merge_env_entries(&remote, &local);
+        assert_eq!(
+            merged,
+            vec![
+                ("A".into(), "1".into()),
+                ("B".into(), "9".into()),
+                ("C".into(), "3".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_env_skips_comments_and_export() {
+        let text = "# comment\n\nFOO=bar\nexport BAZ=qux\n";
+        let entries = parse_env_file_contents(text).unwrap();
+        assert_eq!(
+            entries,
+            vec![("FOO".into(), "bar".into()), ("BAZ".into(), "qux".into())]
+        );
     }
 }

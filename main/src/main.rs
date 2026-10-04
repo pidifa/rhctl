@@ -33,7 +33,9 @@ use crate::handlers::command_handler::{
     parse_execute_config_from_cmd, parse_patch_config_from_cmd, parse_run_steps,
     parse_upload_config_from_cmd, ParsedRunStep,
 };
-use crate::utils::file_utils::{load_yaml_config, resolve_upload_mappings};
+use crate::utils::file_utils::{
+    load_yaml_config, resolve_patch_env_mappings, resolve_upload_mappings,
+};
 use crate::utils::log_utils::{ask_user_and_abort_option, flush_logs_and_exit, init_logger};
 
 fn parse_duration(s: &str) -> Result<Duration, String> {
@@ -96,6 +98,12 @@ enum Commands {
             help = "Transfer file with local=remote-dir lines (same format as --transfer)"
         )]
         transfer_file: Option<String>,
+
+        #[arg(
+            long = "patch-env",
+            help = "Merge local .env into remote .env (local=remote-file). Local keys overwrite; remote-only keys kept. Repeatable."
+        )]
+        patch_env: Vec<String>,
 
         #[arg(long, default_value = "false", help = "Use sudo for operations")]
         use_sudo: bool,
@@ -373,6 +381,7 @@ async fn main() {
 
             transfer,
             transfer_file,
+            patch_env,
 
             use_sudo,
             use_rsync,
@@ -384,12 +393,12 @@ async fn main() {
             max_session_lifetime,
             ..
         } => {
-            if transfer.is_empty() && transfer_file.is_none() {
+            if transfer.is_empty() && transfer_file.is_none() && patch_env.is_empty() {
                 log_error_with_host_direct!(
                     user.as_str(),
                     host.as_str(),
                     UPLOAD_TASK_NAME,
-                    "Provide at least one of --transfer or --transfer-file"
+                    "Provide at least one of --transfer, --transfer-file, or --patch-env"
                 );
                 exit(1);
             }
@@ -402,6 +411,7 @@ async fn main() {
                 certificate,
                 transfer_file,
                 transfer,
+                patch_env,
                 use_sudo,
                 use_rsync,
                 silent,
@@ -417,6 +427,19 @@ async fn main() {
                 &config.transfers,
                 &env_vars,
             ) {
+                Ok(m) => m,
+                Err(e) => {
+                    log_error_with_host_direct!(
+                        user.as_str(),
+                        host.as_str(),
+                        UPLOAD_TASK_NAME,
+                        "{}",
+                        e
+                    );
+                    exit(1);
+                }
+            };
+            let patch_envs = match resolve_patch_env_mappings(&config.patch_envs, &env_vars) {
                 Ok(m) => m,
                 Err(e) => {
                     log_error_with_host_direct!(
@@ -474,6 +497,7 @@ async fn main() {
                 let result = commands::upload::run(
                     &config,
                     &mappings,
+                    &patch_envs,
                     &server_metadata,
                     global_server_pool_clone.clone(),
                 )
@@ -801,6 +825,16 @@ async fn main() {
                                     flush_logs_and_exit(log_handle).await;
                                 }
                             };
+                            let patch_envs = match resolve_patch_env_mappings(
+                                &config.patch_envs,
+                                &vars,
+                            ) {
+                                Ok(m) => m,
+                                Err(e) => {
+                                    log_error_root!("{}", e);
+                                    flush_logs_and_exit(log_handle).await;
+                                }
+                            };
                             let global_server_pool_clone = global_server_pool.clone();
                             let handle = tokio::spawn(async move {
                                 if let Err(e) = global_server_pool_clone
@@ -818,6 +852,7 @@ async fn main() {
                                 match commands::upload::run(
                                     &config,
                                     &mappings,
+                                    &patch_envs,
                                     &server_metadata,
                                     global_server_pool_clone.clone(),
                                 )

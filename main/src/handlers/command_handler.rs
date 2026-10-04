@@ -272,6 +272,7 @@ pub fn parse_upload_config_from_cmd(
     certificate_file: Option<String>,
     transfer_file: Option<String>,
     transfers: Vec<String>,
+    patch_envs: Vec<String>,
 
     use_sudo: bool,
     use_rsync: bool,
@@ -292,6 +293,15 @@ pub fn parse_upload_config_from_cmd(
         host,
         UPLOAD_TASK_NAME,
     );
+    if transfer_file.is_none() && transfers.is_empty() && patch_envs.is_empty() {
+        log_error_with_host_direct!(
+            user,
+            host,
+            UPLOAD_TASK_NAME,
+            "Provide at least one of --transfer, --transfer-file, or --patch-env"
+        );
+        exit(1);
+    }
     let transfer_file = transfer_file.map(|f| {
         substitute_vars(&f, vars).unwrap_or_else(|e| {
             log_error_with_host_direct!(user, host, UPLOAD_TASK_NAME, "{}", e);
@@ -317,6 +327,7 @@ pub fn parse_upload_config_from_cmd(
         silent,
         transfer_file,
         transfers,
+        patch_envs,
     }
 }
 
@@ -494,12 +505,15 @@ fn build_upload_step_configs(
 ) -> Vec<(UploadCmdConfig, HashMap<String, String>)> {
     let mut configs = Vec::new();
     for server in servers {
-        if upload.transfer_file.is_none() && upload.transfers.is_empty() {
+        if upload.transfer_file.is_none()
+            && upload.transfers.is_empty()
+            && upload.patch_envs.is_empty()
+        {
             log_error_with_host_direct!(
                 &server.user,
                 &server.host,
                 UPLOAD_TASK_NAME,
-                "Upload step requires transfer-file and/or transfers"
+                "Upload step requires transfer-file, transfers, and/or patch-envs"
             );
             exit(1);
         }
@@ -517,6 +531,7 @@ fn build_upload_step_configs(
                 silent: upload.silent.or(named_config.silent).unwrap_or(false),
                 transfer_file,
                 transfers: upload.transfers.clone(),
+                patch_envs: upload.patch_envs.clone(),
             },
             var_map.clone(),
         ));
