@@ -361,7 +361,10 @@ impl SessionPool {
     pub async fn get_session(&self) -> Result<Arc<LiveSessionWrapper>, SshError> {
         {
             let mut idle_guard = self.idle_sessions.lock().unwrap();
-            if let Some(idle) = idle_guard.pop() {
+            while let Some(idle) = idle_guard.pop() {
+                if idle.live.raw.is_closed() {
+                    continue;
+                }
                 let wrapper = Arc::new(LiveSessionWrapper::new(
                     idle.live,
                     self.server_metadata.max_channels_per_session,
@@ -375,7 +378,7 @@ impl SessionPool {
         {
             let active_guard = self.active_sessions.lock().unwrap();
             for s in active_guard.iter() {
-                if s.channel_semaphore.available_permits() > 0 {
+                if !s.live.raw.is_closed() && s.channel_semaphore.available_permits() > 0 {
                     return Ok(s.clone());
                 }
             }
@@ -412,7 +415,9 @@ impl SessionPool {
         let mut idle_guard = self.idle_sessions.lock().unwrap();
 
         active_guard.retain(|s| {
-            if s.is_fully_idle() {
+            if s.live.raw.is_closed() {
+                false
+            } else if s.is_fully_idle() {
                 idle_guard.push(Idle {
                     live: s.live.clone(),
                     idle_since: Instant::now(),
@@ -426,7 +431,10 @@ impl SessionPool {
 
     fn cleanup_idle(&self) {
         let mut idle_guard = self.idle_sessions.lock().unwrap();
-        idle_guard.retain(|s| s.idle_since.elapsed() <= self.server_metadata.max_session_lifetime);
+        idle_guard.retain(|s| {
+            !s.live.raw.is_closed()
+                && s.idle_since.elapsed() <= self.server_metadata.max_session_lifetime
+        });
     }
 }
 
@@ -1400,12 +1408,9 @@ async fn exec_with_stream(
                 .await?;
             }
         } else {
-            let mut file = File::open(local_file_or_dir)
-                .map_err(|e| format!("Failed to open local file {:?}: {}", local_file_or_dir, e))?;
-            let metadata = file.metadata().map_err(|e| format!("metadata: {}", e))?;
-            let mut buffer = Vec::new();
-            file.read_to_end(&mut buffer)
-                .map_err(|e| format!("read: {}", e))?;
+            let metadata = std::fs::metadata(local_file_or_dir)
+                .map_err(|e| format!("Failed to stat local file {:?}: {}", local_file_or_dir, e))?;
+            let file_size = metadata.len();
 
             // Enable scp receiver
             let scp_cmd = format!("scp -t {}", remote_target);
@@ -1422,7 +1427,7 @@ async fn exec_with_stream(
             // Send header
             let filename = local_file_or_dir.file_name().unwrap().to_str().unwrap();
             let mode = 0o644;
-            let header = format!("C{:04o} {} {}\n", mode, buffer.len(), filename);
+            let header = format!("C{:04o} {} {}\n", mode, file_size, filename);
             channel_guard
                 .channel
                 .data(header.as_bytes())
@@ -1454,6 +1459,9 @@ async fn exec_with_stream(
                 .data(&mut cursor)
                 .await
                 .map_err(|e| e.to_string())?;
+
+            // Wait for ACK after finishing file transfer
+            self.wait_for_ack(&mut channel_guard.channel).await?;
 
             channel_guard
                 .channel
