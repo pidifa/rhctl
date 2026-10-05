@@ -126,13 +126,9 @@ pub async fn run(
     server_metadata: &Arc<ServerMetadata>,
     global_server_pool: Arc<ServerPool>,
 ) -> Result<(), String> {
-    if uploads.is_empty() && downloads.is_empty() {
-        return Err("Provide at least one of --upload or --download".to_string());
+    if uploads.is_empty() && downloads.is_empty() && patch_envs.is_empty() {
+        return Err("Provide at least one of --upload or --download or --patch-env".to_string());
     }
-    if !patch_envs.is_empty() && uploads.is_empty() {
-        return Err("--patch-env can only be used with upload mappings".to_string());
-    }
-
     let mut tasks = Vec::new();
 
     for (local_item, remote_dir) in uploads {

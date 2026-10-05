@@ -277,21 +277,12 @@ pub fn parse_transfer_config_from_cmd(
     );
     let has_upload = upload_mapping.is_some() || !uploads.is_empty();
     let has_download = download_mapping.is_some() || !downloads.is_empty();
-    if !has_upload && !has_download {
+    if !has_upload && !has_download && patch_envs.is_empty() {
         log_error_with_host_direct!(
             user,
             host,
             TRANSFER_TASK_NAME,
-            "Provide at least one of --upload or --download"
-        );
-        exit(1);
-    }
-    if !patch_envs.is_empty() && !has_upload {
-        log_error_with_host_direct!(
-            user,
-            host,
-            TRANSFER_TASK_NAME,
-            "--patch-env can only be used with upload mappings"
+            "Provide at least one of --upload or --download or --patch-env"
         );
         exit(1);
     }
