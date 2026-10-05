@@ -27,7 +27,9 @@ use crate::domain::yml_config::{
 };
 use crate::utils::file_utils::{expand_vars, substitute_vars, validate_path_chars};
 use crate::utils::log_utils::prompt_password_or_exit;
-use crate::{log_error_direct, log_error_with_host_direct, log_warn_direct, log_warn_root};
+use crate::{
+    log_error_direct, log_error_with_host_direct, log_info_direct, log_warn_direct, log_warn_root,
+};
 
 fn resolve_script_invocation(
     raw: &str,
@@ -214,6 +216,40 @@ pub fn parse_execute_config_from_cmd(
         log_error_with_host_direct!(user, host, EXECUTE_TASK_NAME, "{}", e);
         exit(1);
     }
+    // Resolve scripts first so they can be validated locally before any remote work.
+    let scripts: Vec<crate::domain::cmd_params::ScriptInvocation> = script
+        .into_iter()
+        .map(|s| {
+            resolve_script_invocation(&s, vars).unwrap_or_else(|e| {
+                log_error_with_host_direct!(user, host, EXECUTE_TASK_NAME, "{}", e);
+                exit(1);
+            })
+        })
+        .collect();
+    // Fail fast: reject broken scripts locally before the connectivity check,
+    // upload, or remote execution.
+    match crate::commands::execute::validate_scripts_locally(&scripts) {
+        Ok(report) => {
+            let passed = scripts.len() - report.skipped.len();
+            if passed > 0 {
+                log_info_direct!(
+                    "Local 'bash -n' syntax check passed for {} script(s)",
+                    passed
+                );
+            }
+            for (path, reason) in &report.skipped {
+                log_warn_root!(
+                    "Skipped local 'bash -n' check for '{}': {}",
+                    path,
+                    reason
+                );
+            }
+        }
+        Err(e) => {
+            log_error_with_host_direct!(user, host, EXECUTE_TASK_NAME, "{}", e);
+            exit(1);
+        }
+    }
     ExecuteCmdConfig {
         server_metadata: build_server_metadata(
             host,
@@ -231,15 +267,7 @@ pub fn parse_execute_config_from_cmd(
         use_sudo,
         use_rsync,
         silent,
-        scripts: script
-            .into_iter()
-            .map(|s| {
-                resolve_script_invocation(&s, vars).unwrap_or_else(|e| {
-                    log_error_with_host_direct!(user, host, EXECUTE_TASK_NAME, "{}", e);
-                    exit(1);
-                })
-            })
-            .collect(),
+        scripts,
         cmds,
         env_extract_regexes: env_extract_regex,
         env_names: env_name,

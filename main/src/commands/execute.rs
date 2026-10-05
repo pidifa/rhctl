@@ -8,7 +8,9 @@
  * Since: 1.0.0
  * Date: October 16, 2025
  */
+use std::io::Write;
 use std::path::Path;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 use regex::Regex;
@@ -16,7 +18,7 @@ use regex::Regex;
 use crate::common::ssh_pool::ServerPool;
 use crate::domain::cmd_params::{ExecuteCmdConfig, ScriptInvocation, ServerMetadata};
 use crate::domain::constants::{DANGEROUS_PATHS, EXECUTE_TASK_NAME};
-use crate::{log_debug, log_info};
+use crate::{log_debug, log_info, log_warn};
 use futures::future::join_all;
 
 /// Single-quote escape for remote bash (safe inside `sudo bash -c '…'`).
@@ -35,6 +37,125 @@ fn build_remote_script_command(work_path: &str, remote_script: &str, args: &[Str
 
 fn build_remote_cmd_command(work_path: &str, cmd: &str) -> String {
     format!("cd {} && {}", work_path, cmd)
+}
+
+/// Outcome of a local `bash -n` syntax check.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ScriptSyntaxStatus {
+    /// `bash -n` reported a syntax error; string holds bash's diagnostic.
+    Error(String),
+    /// The check could not run (no local `bash`, unreadable file, ...).
+    Unavailable(String),
+    /// The script passed the syntax check.
+    Ok,
+}
+
+/// Run `bash -n` on a local script, before anything is uploaded to the remote host.
+///
+/// The file content is piped to `bash -n` through stdin instead of passing the
+/// path as an argument, so the check also works when the local `bash` is a
+/// Windows-side launcher (WSL / Git Bash) that cannot resolve local paths.
+pub fn check_script_syntax(script_path: &Path) -> ScriptSyntaxStatus {
+    let content = match std::fs::read(script_path) {
+        Ok(content) => content,
+        Err(e) => {
+            return ScriptSyntaxStatus::Unavailable(format!(
+                "failed to read '{}': {}",
+                script_path.display(),
+                e
+            ));
+        }
+    };
+    let mut child = match Command::new("bash")
+        .arg("-n")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            return ScriptSyntaxStatus::Unavailable(format!(
+                "local 'bash' is not available: {}",
+                e
+            ));
+        }
+    };
+    // Feed the exact file bytes (LF endings preserved); a broken pipe only means
+    // bash stopped reading, which is surfaced through its exit status below.
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(&content);
+    }
+    let output = match child.wait_with_output() {
+        Ok(output) => output,
+        Err(e) => {
+            return ScriptSyntaxStatus::Unavailable(format!("failed to run 'bash -n': {}", e));
+        }
+    };
+    if output.status.success() {
+        return ScriptSyntaxStatus::Ok;
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let diagnostics: Vec<&str> = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.to_ascii_lowercase().contains("syntax error"))
+        .collect();
+    if !diagnostics.is_empty() {
+        return ScriptSyntaxStatus::Error(diagnostics.join("\n\t> "));
+    }
+    // No parse failure in the output: treat it as an infrastructure problem
+    // (launcher/WSL warnings, ...) rather than a broken script, so we never
+    // reject a script for reasons unrelated to its content.
+    let stderr = stderr.trim().to_string();
+    ScriptSyntaxStatus::Unavailable(format!(
+        "'bash -n' exited with {}{}",
+        output.status,
+        if stderr.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", stderr)
+        }
+    ))
+}
+
+/// Scripts whose local syntax check could not be performed, as `(path, reason)`.
+#[derive(Debug)]
+pub struct LocalSyntaxCheckReport {
+    pub skipped: Vec<(String, String)>,
+}
+
+/// Verify every script locally (exists + `bash -n`) before any remote work, so a
+/// broken script is never uploaded or executed on the remote host.
+///
+/// Returns `Err` on the first script that fails its checks; scripts whose
+/// check could not run are reported in [`LocalSyntaxCheckReport::skipped`].
+pub fn validate_scripts_locally(
+    scripts: &[ScriptInvocation],
+) -> Result<LocalSyntaxCheckReport, String> {
+    let mut skipped = Vec::new();
+    for script in scripts {
+        let path = Path::new(&script.path);
+        if !path.exists() || !path.is_file() {
+            return Err(format!(
+                "Script file '{}' does not exist or is not a file",
+                script.path
+            ));
+        }
+        match check_script_syntax(path) {
+            ScriptSyntaxStatus::Ok => {}
+            ScriptSyntaxStatus::Unavailable(reason) => {
+                skipped.push((script.path.clone(), reason));
+            }
+            ScriptSyntaxStatus::Error(detail) => {
+                return Err(format!(
+                    "Local syntax check failed for '{}' (bash -n)\n\t> {}",
+                    script.path, detail
+                ));
+            }
+        }
+    }
+    Ok(LocalSyntaxCheckReport { skipped })
 }
 
 /// Remote env file target: absolute (`/etc/myapp/.env`) or home-relative (`~/app/.env`).
@@ -179,29 +300,29 @@ fn python_str_literal(s: &str) -> String {
 }
 
 fn build_upsert_env_command(env_write_file: &str, env_name: &str, value: &str) -> String {
-    // Avoid indented `if` blocks: Rust `\n\` line-continuations strip leading spaces,
-    // which caused IndentationError under `python3 -c`.
-    let py = format!(
-        "from pathlib import Path\n\
-file_path = Path({file})\n\
-missing_dirs = []\n\
-scan_dir = file_path.parent\n\
-while not scan_dir.exists() and scan_dir.parent != scan_dir:\n\
-missing_dirs.append(scan_dir)\n\
-scan_dir = scan_dir.parent\n\
-for new_dir in reversed(missing_dirs):\n\
-new_dir.mkdir(mode=0o700, exist_ok=True)\n\
-new_dir.chmod(0o700)\n\
-key = {key}\n\
-value = {value}\n\
-lines = [ln for ln in (file_path.read_text(encoding='utf-8').splitlines() if file_path.exists() else []) if not ln.startswith(key + '=')]\n\
-lines.append(key + '=' + value)\n\
-file_path.write_text('\\n'.join(lines) + '\\n', encoding='utf-8')\n\
-file_path.chmod(0o600)\n",
-        file = python_str_literal(env_write_file),
-        key = python_str_literal(env_name),
-        value = python_str_literal(value),
-    );
+    // Build the script line by line: Rust's `\`-continuations strip the leading
+    // whitespace of the following source line, which silently removed the Python
+    // block indentation and caused `IndentationError: expected an indented block`
+    // under `python3 -c`. Keeping indentation inside quoted strings avoids that.
+    let py = [
+        "from pathlib import Path".to_string(),
+        format!("file_path = Path({})", python_str_literal(env_write_file)),
+        "missing_dirs = []".to_string(),
+        "scan_dir = file_path.parent".to_string(),
+        "while not scan_dir.exists() and scan_dir.parent != scan_dir:".to_string(),
+        "    missing_dirs.append(scan_dir)".to_string(),
+        "    scan_dir = scan_dir.parent".to_string(),
+        "for new_dir in reversed(missing_dirs):".to_string(),
+        "    new_dir.mkdir(mode=0o700, exist_ok=True)".to_string(),
+        "    new_dir.chmod(0o700)".to_string(),
+        format!("key = {}", python_str_literal(env_name)),
+        format!("value = {}", python_str_literal(value)),
+        "lines = [ln for ln in (file_path.read_text(encoding='utf-8').splitlines() if file_path.exists() else []) if not ln.startswith(key + '=')]".to_string(),
+        "lines.append(key + '=' + value)".to_string(),
+        r"file_path.write_text('\n'.join(lines) + '\n', encoding='utf-8')".to_string(),
+        "file_path.chmod(0o600)".to_string(),
+    ]
+    .join("\n");
     format!("python3 -c {}", shell_quote(&py))
 }
 
@@ -282,6 +403,30 @@ pub async fn run(
         &config.env_names,
         config.env_write_file.as_deref(),
     )?;
+
+    // Local pre-flight: reject broken scripts before any remote connection work,
+    // upload, or execution.
+    let syntax_report = validate_scripts_locally(&config.scripts)?;
+    if !config.scripts.is_empty() {
+        let passed = config.scripts.len() - syntax_report.skipped.len();
+        if passed > 0 {
+            log_debug!(
+                server_metadata,
+                EXECUTE_TASK_NAME,
+                "Local 'bash -n' syntax check passed for {} script(s)",
+                passed
+            );
+        }
+    }
+    for (path, reason) in &syntax_report.skipped {
+        log_warn!(
+            server_metadata,
+            EXECUTE_TASK_NAME,
+            "Skipped local 'bash -n' check for '{}': {}",
+            path,
+            reason
+        );
+    }
 
     let mut all_output = String::new();
 
@@ -580,11 +725,314 @@ mod tests {
         assert!(cmd.contains("postgres://db"), "{}", cmd);
         assert!(cmd.contains("file_path.chmod(0o600)"), "{}", cmd);
         assert!(cmd.contains("mkdir(mode=0o700"), "{}", cmd);
+        // Regression: block bodies must keep their indentation (`\`-continuations
+        // used to strip it, causing IndentationError on the remote host).
+        assert!(
+            cmd.contains("\nwhile not scan_dir.exists()"),
+            "loop header must be at column 0:\n{}",
+            cmd
+        );
+        assert!(
+            cmd.contains("\n    missing_dirs.append(scan_dir)"),
+            "while body must be indented:\n{}",
+            cmd
+        );
+        assert!(
+            cmd.contains("\n    scan_dir = scan_dir.parent"),
+            "while body must be indented:\n{}",
+            cmd
+        );
+        assert!(
+            cmd.contains("\n    new_dir.mkdir(mode=0o700, exist_ok=True)"),
+            "for body must be indented:\n{}",
+            cmd
+        );
+        assert!(
+            cmd.contains("\n    new_dir.chmod(0o700)"),
+            "for body must be indented:\n{}",
+            cmd
+        );
         // The old hard-coded default must be gone.
         assert!(!cmd.contains("/etc/rhctl"), "{}", cmd);
 
         // A home-relative target is kept as-is (resolved remotely before this call).
         let cmd = build_upsert_env_command("~/myapp/.env", "DB_URL", "1");
         assert!(cmd.contains("~/myapp/.env"), "{}", cmd);
+    }
+
+    /// The sudo path in `ssh_pool` wraps the command with `shlex::try_quote`
+    /// before it reaches the remote shell. Prove that round-trip is lossless,
+    /// including the block indentation the fix depends on.
+    #[test]
+    fn upsert_command_round_trips_shell_quoting() {
+        let cmd = build_upsert_env_command(
+            "/etc/pidifa/.env",
+            "DATABASE_URL_1",
+            "postgres://user:pass@127.0.0.1:23759/db",
+        );
+        let quoted = shlex::try_quote(&cmd).unwrap().to_string();
+        let parts = shlex::split(&quoted).unwrap();
+        assert_eq!(parts, vec![cmd.clone()], "quoting must be lossless");
+        assert!(
+            parts[0].contains("\n    missing_dirs.append(scan_dir)"),
+            "indentation must survive shell quoting:\n{}",
+            parts[0]
+        );
+    }
+
+    /// Full remote simulation: run the generated command through a real
+    /// `bash -c <cmd>` — the exact layering `ssh_pool` uses after `shlex`
+    /// unwrapping — and verify the env file is created and written.
+    ///
+    /// Skips when this machine has no usable `bash` + `python3` pair.
+    #[test]
+    fn upsert_command_executes_through_bash() {
+        let probe = std::process::Command::new("bash")
+            .args(["-c", "command -v python3 >/dev/null 2>&1"])
+            .output();
+        if !matches!(&probe, Ok(o) if o.status.success()) {
+            eprintln!("skipped: no local bash with python3");
+            return;
+        }
+        // Make the local temp dir addressable inside that bash
+        // (WSL: C:/Users/... -> /mnt/c/Users/...; Git Bash -> /c/Users/...).
+        let temp = std::env::temp_dir().to_string_lossy().replace('\\', "/");
+        let candidates: Vec<String> = if temp.len() >= 2 && temp.as_bytes()[1] == b':' {
+            let drive = temp[..1].to_ascii_lowercase();
+            let rest = temp[2..].to_string();
+            vec![format!("/mnt{}{}", drive, rest), format!("/{}{}", drive, rest)]
+        } else {
+            vec![temp.clone()]
+        };
+        let mut probe_log = String::new();
+        let mut bash_temp = None;
+        for candidate in &candidates {
+            let out = std::process::Command::new("bash")
+                .args(["-c", &format!("test -d '{}'", candidate)])
+                .output();
+            match &out {
+                Ok(o) if o.status.success() => {
+                    bash_temp = Some(candidate.clone());
+                    break;
+                }
+                other => probe_log.push_str(&format!(
+                    "\n\tprobe '{}': {:?}",
+                    candidate,
+                    other.as_ref().map(|o| (
+                        o.status.code(),
+                        String::from_utf8_lossy(&o.stderr).to_string()
+                    ))
+                )),
+            }
+        }
+        let bash_temp = match bash_temp {
+            Some(dir) => dir,
+            None => {
+                eprintln!(
+                    "skipped: temp dir not visible to local bash (temp={}){}",
+                    temp, probe_log
+                );
+                return;
+            }
+        };
+
+        let local_file = std::env::temp_dir()
+            .join("rhctl_bash_e2e")
+            .join("nested")
+            .join("app.env");
+        let _ = std::fs::remove_file(&local_file);
+        let bash_file = format!("{}/rhctl_bash_e2e/nested/app.env", bash_temp);
+        let expected_value = "postgres://test:test@127.0.0.1:23759/db1";
+        let cmd = build_upsert_env_command(&bash_file, "DATABASE_URL_1", expected_value);
+
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&cmd)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "bash -c round-trip failed:\n---\n{}\n---\nstdout:\n{}\nstderr:\n{}",
+            cmd,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let content = std::fs::read_to_string(&local_file)
+            .expect("env file was not written")
+            .replace("\r\n", "\n");
+        assert_eq!(
+            content,
+            format!("DATABASE_URL_1={}\n", expected_value)
+        );
+        let _ = std::fs::remove_file(&local_file);
+    }
+
+    /// Reverse `shell_quote`'s `'` -> `'\''` escaping to recover the python source.
+    fn extract_python_source(cmd: &str) -> String {
+        let body = cmd
+            .strip_prefix("python3 -c '")
+            .and_then(|b| b.strip_suffix('\''))
+            .expect("expected a `python3 -c '<quoted>'` command");
+        body.replace("'\\''", "'")
+    }
+
+    fn local_python() -> Option<&'static str> {
+        for candidate in ["python3", "python"] {
+            if let Ok(out) = std::process::Command::new(candidate)
+                .arg("--version")
+                .output()
+            {
+                if out.status.success() {
+                    return Some(candidate);
+                }
+            }
+        }
+        None
+    }
+
+    /// End-to-end regression test for the remote `IndentationError`: execute the
+    /// *generated* python source with a real interpreter, create the missing
+    /// parent dirs, then upsert the same key a second time.
+    #[test]
+    fn upsert_command_python_executes_and_upserts() {
+        let python = match local_python() {
+            Some(python) => python,
+            None => {
+                eprintln!("skipped: no local python interpreter");
+                return;
+            }
+        };
+        let base = std::env::temp_dir().join("rhctl_upsert_e2e");
+        let env_file = base.join("nested").join("app.env");
+        let py_file = std::env::temp_dir().join("rhctl_upsert_e2e_check.py");
+        let _ = std::fs::remove_file(&env_file);
+        // Forward slashes (also what absolute/~ remote paths use).
+        let file_arg = env_file.to_string_lossy().replace('\\', "/");
+        // Mirrors the real-world value from the bug report (URL-encoded payload).
+        let value1 = "postgres://test:test@127.0.0.1:23759/db1";
+
+        for (value, expected) in [
+            (value1, format!("DATABASE_URL_1={}\n", value1)),
+            ("second-value", "DATABASE_URL_1=second-value\n".to_string()),
+        ] {
+            let cmd = build_upsert_env_command(&file_arg, "DATABASE_URL_1", value);
+            let source = extract_python_source(&cmd);
+            std::fs::write(&py_file, &source).unwrap();
+            let out = std::process::Command::new(python)
+                .arg(&py_file)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "generated python failed:\n---\n{}\n---\nstderr:\n{}",
+                source,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            // Windows text-mode writes `\r\n`; normalize before comparing
+            // (the Linux remote target always writes plain `\n`).
+            let content = std::fs::read_to_string(&env_file)
+                .unwrap()
+                .replace("\r\n", "\n");
+            assert_eq!(content, expected, "unexpected env file content");
+        }
+
+        let _ = std::fs::remove_file(&env_file);
+        let _ = std::fs::remove_file(&py_file);
+    }
+
+    fn write_temp_script(name: &str, content: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(name);
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    #[test]
+    fn bash_n_accepts_valid_script() {
+        let path = write_temp_script(
+            "rhctl_bash_n_valid.sh",
+            "#!/bin/bash\necho hi\nif true; then\n  echo yes\nfi\n",
+        );
+        match check_script_syntax(&path) {
+            ScriptSyntaxStatus::Ok => {}
+            // Local `bash` missing/unusable: nothing to verify on this host.
+            ScriptSyntaxStatus::Unavailable(reason) => eprintln!("skipped: {}", reason),
+            other => panic!("expected Ok, got {:?}", other),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn bash_n_rejects_broken_script() {
+        let path = write_temp_script("rhctl_bash_n_broken.sh", "#!/bin/bash\nif true; then\necho hi\n");
+        match check_script_syntax(&path) {
+            ScriptSyntaxStatus::Error(detail) => {
+                assert!(detail.to_lowercase().contains("syntax error"), "{}", detail)
+            }
+            // Local `bash` missing/unusable: cannot assert on the diagnostic.
+            ScriptSyntaxStatus::Unavailable(reason) => eprintln!("skipped: {}", reason),
+            other => panic!("expected Error, got {:?}", other),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn validate_scripts_locally_fails_on_syntax_error() {
+        let path = write_temp_script("rhctl_bash_n_validate.sh", "if true; then\necho hi\n");
+        let scripts = vec![ScriptInvocation {
+            path: path.to_string_lossy().into_owned(),
+            args: vec![],
+        }];
+        match validate_scripts_locally(&scripts) {
+            // Local `bash` missing/unusable: the check is reported as skipped.
+            Ok(report) => assert!(!report.skipped.is_empty()),
+            Err(e) => {
+                assert!(e.contains("bash -n"), "{}", e);
+                assert!(e.contains("syntax error"), "{}", e);
+                assert!(e.contains("rhctl_bash_n_validate.sh"), "{}", e);
+            }
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn validate_scripts_locally_rejects_missing_file() {
+        let scripts = vec![ScriptInvocation {
+            path: "/nonexistent/rhctl_missing_script.sh".to_string(),
+            args: vec![],
+        }];
+        let err = validate_scripts_locally(&scripts).unwrap_err();
+        assert!(err.contains("does not exist"), "{}", err);
+    }
+
+    #[test]
+    fn check_script_syntax_reports_unavailable_instead_of_false_error() {
+        // Reading a directory fails, so `bash -n` never runs: this must be
+        // reported as "unavailable" (skip), never as a syntax error.
+        match check_script_syntax(&std::env::temp_dir()) {
+            ScriptSyntaxStatus::Unavailable(reason) => {
+                assert!(reason.contains("failed to read"), "{}", reason)
+            }
+            other => panic!("expected Unavailable, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn validate_scripts_locally_accepts_valid_and_empty_lists() {
+        assert!(validate_scripts_locally(&[]).is_ok());
+
+        let path = write_temp_script(
+            "rhctl_bash_n_ok_list.sh",
+            "#!/bin/bash\nset -e\necho 'all good'\n",
+        );
+        let scripts = vec![ScriptInvocation {
+            path: path.to_string_lossy().into_owned(),
+            args: vec!["--flag".to_string()],
+        }];
+        let report = validate_scripts_locally(&scripts).unwrap();
+        // Either the script passed, or `bash` is unavailable here (skipped).
+        if !report.skipped.is_empty() {
+            assert_eq!(report.skipped.len(), 1);
+        }
+        let _ = std::fs::remove_file(&path);
     }
 }
