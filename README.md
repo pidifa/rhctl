@@ -16,7 +16,7 @@
 - [Build](#build)
 - [Commands](#commands)
   - [rhctl execute](#rhctl-execute)
-  - [rhctl upload](#rhctl-upload)
+  - [rhctl transfer](#rhctl-transfer)
   - [rhctl patch](#rhctl-patch)
   - [rhctl run](#rhctl-run)
 - [SSH Authentication Setup](#ssh-authentication-setup)
