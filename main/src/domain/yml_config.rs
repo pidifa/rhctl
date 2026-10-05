@@ -111,9 +111,12 @@ pub struct ExecuteStep {
     /// Regexes with one capture group each; paired by index with `env-name`.
     #[serde(default)]
     pub env_extract_regex: Vec<String>,
-    /// Env keys for remote `/etc/rhctl/.env`; paired by index with `env-extract-regex`.
+    /// Env keys paired by index with `env-extract-regex`.
     #[serde(default)]
     pub env_name: Vec<String>,
+    /// Remote env file receiving the extracted values; required with `env-extract-regex`.
+    #[serde(default)]
+    pub env_write_file: Option<String>,
     /// Working directory on the remote host. `remote-path` is accepted as an alias.
     #[serde(default, alias = "remote-path")]
     pub work_path: Option<String>,
@@ -195,3 +198,39 @@ pub struct YmlConfig {
     #[serde(default)]
     pub var_map: HashMap<String, String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn execute_step_parses_env_write_file_yaml() {
+        let yaml = "
+env-extract-regex:
+  - 'URL=(.*)'
+env-name:
+  - DB_URL
+env-write-file: /etc/myapp/.env
+";
+        let step: ExecuteStep = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(step.env_extract_regex, vec!["URL=(.*)"]);
+        assert_eq!(step.env_name, vec!["DB_URL"]);
+        assert_eq!(step.env_write_file.as_deref(), Some("/etc/myapp/.env"));
+    }
+
+    #[test]
+    fn execute_step_env_write_file_defaults_to_none() {
+        let step: ExecuteStep = serde_yaml::from_str("cmds: ['echo hi']").unwrap();
+        assert!(step.env_write_file.is_none());
+    }
+
+    #[test]
+    fn run_step_transfer_variant_parses() {
+        let step: RunStep = serde_yaml::from_str("type: transfer\nuploads: ['a=b']").unwrap();
+        match step {
+            RunStep::Transfer(t) => assert_eq!(t.uploads, vec!["a=b"]),
+            _ => panic!("expected transfer step"),
+        }
+    }
+}
+

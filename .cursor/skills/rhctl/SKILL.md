@@ -36,7 +36,7 @@ rhctl execute \
   [--certificate <cert>] \
   [--script <script-or-cmdline> ...] \
   [--cmd <remote-command> ...] \
-  [--env-extract-regex <regex> --env-name <KEY>] \
+  [--env-extract-regex <regex> --env-name <KEY> --env-write-file <path>] \
   [--work-path <path>] \
   [--mode sync|async] \
   [--use-sudo] \
@@ -53,6 +53,7 @@ rhctl execute \
   --script "$SCRIPT_ROOT/postgresql/db.sh --action create --port 5432" \
   --env-extract-regex '\[INFO\][[:space:]]+DATABASE_URL=(.*)' \
   --env-name DB_URL \
+  --env-write-file /etc/myapp/.env \
   --use-sudo
 ```
 
@@ -72,7 +73,7 @@ rhctl execute \
 
 **Optional Parameters**:
 - `--cmd <command>`: Remote shell command (no upload); repeatable
-- `--env-extract-regex` + `--env-name`: Must appear together with the same count (paired by order). Last capture-group match on clean lines (skip `\r`) → upsert each key in `/etc/rhctl/.env` (`chmod 600`)
+- `--env-extract-regex` + `--env-name` + `--env-write-file`: All three required together (no default env file); regexes/names pair by order with the same count. Last capture-group match on clean lines (skip `\r`) → upsert each key into `--env-write-file` (`chmod 600`; missing parent dirs created `700`). Path must be absolute or `~/...` (relative paths and critical system paths rejected); supports `${VAR}`.
 - `--mode <sync|async>`: `sync` (sequential) or `async` (concurrent) for scripts
 - `--work-path <path>`: Remote working directory (default: `~`)
 - `--password <password>`: SSH password (also sudo / key passphrase fallback)
@@ -161,7 +162,7 @@ rhctl run --config <yml-file-path> --config-name <name>
 - `--config <yml-file-path>`
 - `--config-name <name>`
 
-Config shape: config-level `target-servers` / `var-map`, ordered `runs:` with `type: upload|execute|patch`. Upload accepts `transfers` / `transfer-file` / `patch-envs`. Execute accepts `work-path` (alias `remote-path`).
+Config shape: config-level `target-servers` / `var-map`, ordered `runs:` with `type: transfer|execute|patch`. Transfer accepts `transfers` / `transfer-file` / `patch-envs`. Execute accepts `work-path` (alias `remote-path`) and `env-extract-regex` + `env-name` + `env-write-file` (all three required together; no default env file).
 
 For full YAML field details, read `README.md` (`rhctl run` section).
 

@@ -71,7 +71,7 @@ rhctl execute \
   [--certificate <cert>] \
   [--script <script-or-cmdline> ...] \
   [--cmd <remote-command> ...] \
-  [--env-extract-regex <regex> --env-name <KEY>] \
+  [--env-extract-regex <regex> --env-name <KEY> --env-write-file <path>] \
   [--work-path <path>] \
   [--mode sync|async] \
   [options]
@@ -96,6 +96,7 @@ rhctl execute \
   --script "/path/to/scripts/postgresql/db.sh --action create --port 5432" \
   --env-extract-regex '\[INFO\][[:space:]]+DATABASE_URL=(.*)' \
   --env-name DB_URL \
+  --env-write-file /etc/myapp/.env \
   --use-sudo
 ```
 
@@ -128,14 +129,17 @@ echo "Remote Execution 1.2"
 **Optional Parameters**:
 - `--mode <sync|async>`: Execution mode: 'sync' (run sequentially) or 'async' (run concurrently). Applies to scripts; commands always run sequentially after scripts.
 - `--work-path <path>`: Remote working directory (defaults to `~`).
-- `--env-extract-regex <regex>` + `--env-name <KEY>`: Must appear together with the **same count**; paired by order. Search clean output lines (skip `\r`), take the **last** match of capture group 1 per regex, upsert each `KEY=value` into remote `/etc/rhctl/.env`. Prefer `--use-sudo` / root.  
+- `--env-extract-regex <regex>` + `--env-name <KEY>` + `--env-write-file <path>`: These three must be used together — there is **no default** env file. `--env-extract-regex` requires `--env-name` **and** `--env-write-file`; `--env-name` or `--env-write-file` alone requires `--env-extract-regex`.  \
+  Regexes and names must have the **same count**, paired by order. Search clean output lines (skip `\r`), take the **last** match of capture group 1 per regex, upsert each `KEY=value` into `--env-write-file` (`chmod 600`; missing parent directories are created with `700`). Prefer `--use-sudo` / root.  
+  `--env-write-file` must be an absolute remote path (`/etc/myapp/.env`) or home-relative (`~/app/.env`); relative paths, trailing `/`, and critical system paths are rejected. Supports `${VAR}` placeholders; created if missing.  
   Use **single quotes** around the regex so `\[` / `\]` are not stripped by the shell (double quotes turn `\[INFO\]` into a character class `[INFO]`).  
   Example:
   ```bash
   --env-extract-regex '\[INFO\][[:space:]]+DATABASE_URL=(.*)' \
   --env-name DB_URL \
   --env-extract-regex '\[INFO\][[:space:]]+DB_USER=(.*)' \
-  --env-name DB_USER
+  --env-name DB_USER \
+  --env-write-file /etc/myapp/.env
   ```
 
 - `--password <password>`: Remote password (optional when `--identity` is set; also used for sudo and as a private-key passphrase fallback).
@@ -450,9 +454,9 @@ configs:
       ASSETS_ROOT: "/path/to/assets"
 
     runs:
-      - type: upload
-        # transfer-file: "config/path-mapping.properties"
-        transfers:
+      - type: transfer
+        # upload-mapping: "config/path-mapping.properties"
+        uploads:
           - "${ASSETS_ROOT}/example1.txt=~/examples"
         # patch-envs:
         #   - "${ASSETS_ROOT}/app.env=/etc/rhctl/.env"
@@ -471,6 +475,11 @@ configs:
           - "${ASSETS_ROOT}/example-bash1.sh"
           - "${ASSETS_ROOT}/example-bash2.sh"
         mode: sync
+        # Optional: upsert extracted output values into a remote env file.
+        # All three keys are required together (no default env file).
+        # env-extract-regex: ['\[INFO\][[:space:]]+DATABASE_URL=(.*)']
+        # env-name: ["DB_URL"]
+        # env-write-file: "/etc/myapp/.env"
 
 # Common configuration (Optional)
 # Applies to all servers unless overridden in individual server or command configs.

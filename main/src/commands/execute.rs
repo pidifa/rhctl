@@ -15,12 +15,9 @@ use regex::Regex;
 
 use crate::common::ssh_pool::ServerPool;
 use crate::domain::cmd_params::{ExecuteCmdConfig, ScriptInvocation, ServerMetadata};
-use crate::domain::constants::EXECUTE_TASK_NAME;
+use crate::domain::constants::{DANGEROUS_PATHS, EXECUTE_TASK_NAME};
 use crate::{log_debug, log_info};
 use futures::future::join_all;
-
-const RHCTL_ENV_DIR: &str = "/etc/rhctl";
-const RHCTL_ENV_FILE: &str = "/etc/rhctl/.env";
 
 /// Single-quote escape for remote bash (safe inside `sudo bash -c '…'`).
 fn shell_quote(s: &str) -> String {
@@ -40,18 +37,53 @@ fn build_remote_cmd_command(work_path: &str, cmd: &str) -> String {
     format!("cd {} && {}", work_path, cmd)
 }
 
-pub fn validate_env_extract_pairs(
+/// Remote env file target: absolute (`/etc/myapp/.env`) or home-relative (`~/app/.env`).
+/// Relative paths are rejected because the remote shell working directory is not predictable.
+pub fn validate_env_write_file_path(path: &str) -> Result<(), String> {
+    if path.ends_with('/') {
+        return Err(format!(
+            "Invalid --env-write-file '{}': must be a file path, not a directory",
+            path
+        ));
+    }
+    if !path.starts_with('/') && !path.starts_with("~/") {
+        return Err(format!(
+            "Invalid --env-write-file '{}': use an absolute remote path (e.g. /etc/myapp/.env) or ~/app/.env",
+            path
+        ));
+    }
+    if DANGEROUS_PATHS.contains(path.trim_end_matches('/')) {
+        return Err(format!(
+            "Refusing to use critical system path '{}' as --env-write-file (a file path is required)",
+            path
+        ));
+    }
+    Ok(())
+}
+
+/// Validate `--env-extract-regex` / `--env-name` / `--env-write-file`.
+///
+/// There is no default env file: `--env-extract-regex` requires both `--env-name`
+/// and `--env-write-file`, and neither of those may be used on its own.
+pub fn validate_env_extract_options(
     regexes: &[String],
     names: &[String],
+    env_write_file: Option<&str>,
 ) -> Result<(), String> {
-    if regexes.is_empty() && names.is_empty() {
-        return Ok(());
+    let write_file = env_write_file.map(str::trim).filter(|p| !p.is_empty());
+    if regexes.is_empty() {
+        if names.is_empty() && write_file.is_none() {
+            return Ok(());
+        }
+        return Err("--env-name and --env-write-file require --env-extract-regex".to_string());
     }
-    if regexes.is_empty() || names.is_empty() {
-        return Err(
-            "--env-extract-regex and --env-name must be provided together (same count)".to_string(),
-        );
+    if names.is_empty() {
+        return Err("--env-name is required when --env-extract-regex is set".to_string());
     }
+    let write_file = write_file.ok_or_else(|| {
+        "--env-write-file is required when --env-extract-regex is set (there is no default env file)"
+            .to_string()
+    })?;
     if regexes.len() != names.len() {
         return Err(format!(
             "--env-extract-regex count ({}) must match --env-name count ({})",
@@ -59,7 +91,7 @@ pub fn validate_env_extract_pairs(
             names.len()
         ));
     }
-    Ok(())
+    validate_env_write_file_path(write_file)
 }
 
 /// Last capture-group match on lines that do not contain `\\r` (progress output).
@@ -146,22 +178,27 @@ fn python_str_literal(s: &str) -> String {
     format!("'{s}'", s = s.replace('\\', "\\\\").replace('\'', "\\'"))
 }
 
-fn build_upsert_env_command(env_name: &str, value: &str) -> String {
+fn build_upsert_env_command(env_write_file: &str, env_name: &str, value: &str) -> String {
     // Avoid indented `if` blocks: Rust `\n\` line-continuations strip leading spaces,
     // which caused IndentationError under `python3 -c`.
     let py = format!(
         "from pathlib import Path\n\
-dir_path = Path({dir})\n\
-env_file = dir_path / '.env'\n\
-dir_path.mkdir(parents=True, exist_ok=True)\n\
-dir_path.chmod(0o700)\n\
+file_path = Path({file})\n\
+missing_dirs = []\n\
+scan_dir = file_path.parent\n\
+while not scan_dir.exists() and scan_dir.parent != scan_dir:\n\
+missing_dirs.append(scan_dir)\n\
+scan_dir = scan_dir.parent\n\
+for new_dir in reversed(missing_dirs):\n\
+new_dir.mkdir(mode=0o700, exist_ok=True)\n\
+new_dir.chmod(0o700)\n\
 key = {key}\n\
 value = {value}\n\
-lines = [ln for ln in (env_file.read_text(encoding='utf-8').splitlines() if env_file.exists() else []) if not ln.startswith(key + '=')]\n\
+lines = [ln for ln in (file_path.read_text(encoding='utf-8').splitlines() if file_path.exists() else []) if not ln.startswith(key + '=')]\n\
 lines.append(key + '=' + value)\n\
-env_file.write_text('\\n'.join(lines) + '\\n', encoding='utf-8')\n\
-env_file.chmod(0o600)\n",
-        dir = python_str_literal(RHCTL_ENV_DIR),
+file_path.write_text('\\n'.join(lines) + '\\n', encoding='utf-8')\n\
+file_path.chmod(0o600)\n",
+        file = python_str_literal(env_write_file),
         key = python_str_literal(env_name),
         value = python_str_literal(value),
     );
@@ -172,17 +209,18 @@ async fn persist_env_value(
     server_metadata: &Arc<ServerMetadata>,
     global_server_pool: &Arc<ServerPool>,
     use_sudo: bool,
+    env_write_file: &str,
     env_name: &str,
     value: &str,
 ) -> Result<(), String> {
     validate_env_name(env_name)?;
-    let remote_cmd = build_upsert_env_command(env_name, value);
+    let remote_cmd = build_upsert_env_command(env_write_file, env_name, value);
     log_info!(
         server_metadata,
         EXECUTE_TASK_NAME,
         "Writing {} to {}",
         env_name,
-        RHCTL_ENV_FILE
+        env_write_file
     );
     global_server_pool
         .exec_with_log(
@@ -198,9 +236,36 @@ async fn persist_env_value(
         "Saved {}={} in {}",
         env_name,
         value,
-        RHCTL_ENV_FILE
+        env_write_file
     );
     Ok(())
+}
+
+/// Resolve the remote env file target once (expands a leading `~` on the remote host).
+async fn resolve_env_write_file(
+    server_metadata: &Arc<ServerMetadata>,
+    global_server_pool: &Arc<ServerPool>,
+    use_sudo: bool,
+    env_write_file: &str,
+) -> Result<String, String> {
+    let resolved = global_server_pool
+        .resolve_remote_path(
+            server_metadata,
+            EXECUTE_TASK_NAME,
+            use_sudo,
+            env_write_file,
+        )
+        .await?
+        .trim()
+        .to_string();
+    if resolved.is_empty() {
+        return Err(format!(
+            "Failed to resolve remote env file '{}'",
+            env_write_file
+        ));
+    }
+    validate_env_write_file_path(&resolved)?;
+    Ok(resolved)
 }
 
 pub async fn run(
@@ -212,7 +277,11 @@ pub async fn run(
         return Err("Provide at least one --script or --cmd".to_string());
     }
 
-    validate_env_extract_pairs(&config.env_extract_regexes, &config.env_names)?;
+    validate_env_extract_options(
+        &config.env_extract_regexes,
+        &config.env_names,
+        config.env_write_file.as_deref(),
+    )?;
 
     let mut all_output = String::new();
 
@@ -356,20 +425,32 @@ pub async fn run(
         all_output.push_str(&out);
     }
 
-    for (pattern, env_name) in config
-        .env_extract_regexes
-        .iter()
-        .zip(config.env_names.iter())
-    {
-        let value = extract_env_value(&all_output, pattern)?;
-        persist_env_value(
+    // No default env file: the target is always the user-supplied --env-write-file.
+    if !config.env_extract_regexes.is_empty() {
+        let env_write_file = resolve_env_write_file(
             server_metadata,
             &global_server_pool,
             config.use_sudo,
-            env_name,
-            &value,
+            config.env_write_file.as_deref().unwrap_or_default(),
         )
         .await?;
+
+        for (pattern, env_name) in config
+            .env_extract_regexes
+            .iter()
+            .zip(config.env_names.iter())
+        {
+            let value = extract_env_value(&all_output, pattern)?;
+            persist_env_value(
+                server_metadata,
+                &global_server_pool,
+                config.use_sudo,
+                &env_write_file,
+                env_name,
+                &value,
+            )
+            .await?;
+        }
     }
 
     if !config.scripts.is_empty() && config.cmds.is_empty() {
@@ -415,5 +496,95 @@ mod tests {
     #[test]
     fn extract_requires_capture_group() {
         assert!(extract_env_value("a=1", r"a=1").is_err());
+    }
+
+    fn vec_of(values: &[&str]) -> Vec<String> {
+        values.iter().map(|v| v.to_string()).collect()
+    }
+
+    #[test]
+    fn env_options_ok_when_nothing_set() {
+        assert!(validate_env_extract_options(&[], &[], None).is_ok());
+    }
+
+    #[test]
+    fn env_options_ok_with_regex_name_and_write_file() {
+        let regexes = vec_of(&[r"URL=(.*)", r"USER=(.*)"]);
+        let names = vec_of(&["DB_URL", "DB_USER"]);
+        assert!(validate_env_extract_options(&regexes, &names, Some("/etc/myapp/.env")).is_ok());
+        assert!(validate_env_extract_options(&regexes, &names, Some("~/myapp/.env")).is_ok());
+        assert!(validate_env_extract_options(&regexes, &names, Some(" /etc/myapp/.env ")).is_ok());
+    }
+
+    #[test]
+    fn env_options_require_write_file_with_regex() {
+        let regexes = vec_of(&[r"URL=(.*)"]);
+        let names = vec_of(&["DB_URL"]);
+        let err = validate_env_extract_options(&regexes, &names, None).unwrap_err();
+        assert!(err.contains("--env-write-file is required"), "{}", err);
+        // An empty value behaves like "not provided".
+        assert!(validate_env_extract_options(&regexes, &names, Some("  ")).is_err());
+    }
+
+    #[test]
+    fn env_options_require_name_with_regex() {
+        let regexes = vec_of(&[r"URL=(.*)"]);
+        let err =
+            validate_env_extract_options(&regexes, &[], Some("/etc/myapp/.env")).unwrap_err();
+        assert!(err.contains("--env-name is required"), "{}", err);
+    }
+
+    #[test]
+    fn env_name_and_write_file_require_regex() {
+        let names = vec_of(&["DB_URL"]);
+        let err = validate_env_extract_options(&[], &names, Some("/etc/myapp/.env")).unwrap_err();
+        assert!(err.contains("require --env-extract-regex"), "{}", err);
+
+        let regexes = vec_of(&[r"URL=(.*)"]);
+        let err = validate_env_extract_options(&[], &[], Some("/etc/myapp/.env")).unwrap_err();
+        assert!(err.contains("require --env-extract-regex"), "{}", err);
+        let _ = regexes;
+    }
+
+    #[test]
+    fn env_options_check_matching_counts() {
+        let regexes = vec_of(&[r"URL=(.*)"]);
+        let names = vec_of(&["DB_URL", "DB_USER"]);
+        let err =
+            validate_env_extract_options(&regexes, &names, Some("/etc/myapp/.env")).unwrap_err();
+        assert!(err.contains("count"), "{}", err);
+    }
+
+    #[test]
+    fn env_write_file_path_must_be_absolute_file() {
+        assert!(validate_env_write_file_path("/etc/myapp/.env").is_ok());
+        assert!(validate_env_write_file_path("~/myapp/.env").is_ok());
+        // Relative paths are ambiguous on the remote host.
+        assert!(validate_env_write_file_path("myapp/.env").is_err());
+        // Directories are not env files.
+        assert!(validate_env_write_file_path("/etc/myapp/").is_err());
+        // Critical system directories are never valid targets.
+        assert!(validate_env_write_file_path("/etc").is_err());
+        assert!(validate_env_write_file_path("/").is_err());
+        assert!(validate_env_write_file_path("/etc/").is_err());
+    }
+
+    #[test]
+    fn upsert_command_targets_given_env_file() {
+        let cmd = build_upsert_env_command("/etc/myapp/.env", "DB_URL", "postgres://db");
+        assert!(cmd.starts_with("python3 -c '"), "{}", cmd);
+        // Path/key/value are single-quote shell-escaped (`'` -> `'"'"'`), so assert
+        // on the raw substrings instead of the unescaped python source.
+        assert!(cmd.contains("/etc/myapp/.env"), "{}", cmd);
+        assert!(cmd.contains("DB_URL"), "{}", cmd);
+        assert!(cmd.contains("postgres://db"), "{}", cmd);
+        assert!(cmd.contains("file_path.chmod(0o600)"), "{}", cmd);
+        assert!(cmd.contains("mkdir(mode=0o700"), "{}", cmd);
+        // The old hard-coded default must be gone.
+        assert!(!cmd.contains("/etc/rhctl"), "{}", cmd);
+
+        // A home-relative target is kept as-is (resolved remotely before this call).
+        let cmd = build_upsert_env_command("~/myapp/.env", "DB_URL", "1");
+        assert!(cmd.contains("~/myapp/.env"), "{}", cmd);
     }
 }

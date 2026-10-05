@@ -192,9 +192,15 @@ enum Commands {
 
         #[arg(
             long,
-            help = "Env key written to remote /etc/rhctl/.env (chmod 600). Repeatable; pair by order with --env-extract-regex."
+            help = "Env key upserted into --env-write-file (chmod 600). Repeatable; pair by order with --env-extract-regex."
         )]
         env_name: Vec<String>,
+
+        #[arg(
+            long,
+            help = "Remote env file that receives --env-extract-regex values (no default). Required with --env-extract-regex and --env-name. Created if missing; supports ~ and ${VAR}."
+        )]
+        env_write_file: Option<String>,
 
         #[arg(
  long,
@@ -530,6 +536,7 @@ async fn main() {
             cmd,
             env_extract_regex,
             env_name,
+            env_write_file,
             work_path,
             mode,
 
@@ -554,6 +561,7 @@ async fn main() {
                 cmd,
                 env_extract_regex,
                 env_name,
+                env_write_file,
                 work_path,
                 mode,
                 use_sudo,

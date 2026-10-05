@@ -168,6 +168,7 @@ pub fn parse_execute_config_from_cmd(
     cmds: Vec<String>,
     env_extract_regex: Vec<String>,
     env_name: Vec<String>,
+    env_write_file: Option<String>,
     work_path: Option<String>,
     mode: Option<String>,
     use_sudo: bool,
@@ -198,9 +199,18 @@ pub fn parse_execute_config_from_cmd(
         );
         exit(1);
     }
-    if let Err(e) =
-        crate::commands::execute::validate_env_extract_pairs(&env_extract_regex, &env_name)
-    {
+    let env_write_file = env_write_file
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .map(|p| substitute_vars(&p, vars).unwrap_or_else(|e| {
+            log_error_with_host_direct!(user, host, EXECUTE_TASK_NAME, "{}", e);
+            exit(1);
+        }));
+    if let Err(e) = crate::commands::execute::validate_env_extract_options(
+        &env_extract_regex,
+        &env_name,
+        env_write_file.as_deref(),
+    ) {
         log_error_with_host_direct!(user, host, EXECUTE_TASK_NAME, "{}", e);
         exit(1);
     }
@@ -233,6 +243,7 @@ pub fn parse_execute_config_from_cmd(
         cmds,
         env_extract_regexes: env_extract_regex,
         env_names: env_name,
+        env_write_file,
         mode: mode.unwrap_or(DEFAULT_EXECUTE_MODE.to_string()),
         work_path: substitute_vars(
             &work_path.unwrap_or_else(|| DEFAULT_EXECUTE_WORK_PATH.to_string()),
@@ -548,6 +559,32 @@ fn build_transfer_step_configs(
     }
     configs
 }
+
+/// Resolve `env-write-file` for a YAML execute step: trim it, substitute
+/// `${VAR}` placeholders, then validate the whole env-extract option set.
+///
+/// Validation runs *after* substitution so a placeholder like `${ENV_FILE}`
+/// can expand to an absolute path before it is checked.
+/// Returns the resolved path (`None` when the step has no `env-write-file`).
+fn resolve_step_env_options(
+    execute: &ExecuteStep,
+    var_map: &HashMap<String, String>,
+) -> Result<Option<String>, String> {
+    let write_file = execute
+        .env_write_file
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(|p| substitute_vars(p, var_map))
+        .transpose()?;
+    crate::commands::execute::validate_env_extract_options(
+        &execute.env_extract_regex,
+        &execute.env_name,
+        write_file.as_deref(),
+    )?;
+    Ok(write_file)
+}
+
 fn build_execute_step_configs(
     named_config: &NamedConfig,
     execute: &ExecuteStep,
@@ -562,13 +599,10 @@ fn build_execute_step_configs(
         );
         exit(1);
     }
-    if let Err(e) = crate::commands::execute::validate_env_extract_pairs(
-        &execute.env_extract_regex,
-        &execute.env_name,
-    ) {
+    let env_write_file = resolve_step_env_options(execute, var_map).unwrap_or_else(|e| {
         log_error_direct!("Execute step in config '{}': {}", named_config.name, e);
         exit(1);
-    }
+    });
     let mut configs = Vec::new();
     for server in servers {
         configs.push((
@@ -600,6 +634,7 @@ fn build_execute_step_configs(
                 cmds: execute.cmds.clone(),
                 env_extract_regexes: execute.env_extract_regex.clone(),
                 env_names: execute.env_name.clone(),
+                env_write_file: env_write_file.clone(),
                 mode: execute
                     .mode
                     .clone()
@@ -780,3 +815,76 @@ fn collect_servers_for_step(
     }
     servers.into_iter().collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn step(
+        regexes: &[&str],
+        names: &[&str],
+        write_file: Option<&str>,
+    ) -> crate::domain::yml_config::ExecuteStep {
+        crate::domain::yml_config::ExecuteStep {
+            env_extract_regex: regexes.iter().map(|s| s.to_string()).collect(),
+            env_name: names.iter().map(|s| s.to_string()).collect(),
+            env_write_file: write_file.map(|s| s.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn vars(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn step_env_options_ok_when_nothing_set() {
+        let res = resolve_step_env_options(&step(&[], &[], None), &vars(&[]));
+        assert!(res.is_ok(), "{:?}", res);
+        assert!(res.unwrap().is_none());
+    }
+
+    #[test]
+    fn step_env_options_require_write_file_with_regex() {
+        let res = resolve_step_env_options(&step(&["URL=(.*)"], &["DB_URL"], None), &vars(&[]));
+        assert!(res.is_err(), "expected error, got {:?}", res);
+    }
+
+    #[test]
+    fn step_env_options_treat_blank_write_file_as_missing() {
+        let res = resolve_step_env_options(
+            &step(&["URL=(.*)"], &["DB_URL"], Some("   ")),
+            &vars(&[]),
+        );
+        assert!(res.is_err(), "expected error, got {:?}", res);
+    }
+
+    #[test]
+    fn step_env_options_write_file_requires_regex() {
+        let res =
+            resolve_step_env_options(&step(&[], &[], Some("/etc/myapp/.env")), &vars(&[]));
+        assert!(res.is_err(), "expected error, got {:?}", res);
+    }
+
+    #[test]
+    fn step_env_options_substitute_before_validate() {
+        let res = resolve_step_env_options(
+            &step(&["URL=(.*)"], &["DB_URL"], Some("${ENV_FILE}")),
+            &vars(&[("ENV_FILE", "/etc/myapp/.env")]),
+        );
+        assert_eq!(res.unwrap().unwrap(), "/etc/myapp/.env");
+    }
+
+    #[test]
+    fn step_env_options_reject_relative_after_substitution() {
+        let res = resolve_step_env_options(
+            &step(&["URL=(.*)"], &["DB_URL"], Some("${ENV_FILE}")),
+            &vars(&[("ENV_FILE", "app/.env")]),
+        );
+        assert!(res.is_err(), "expected error, got {:?}", res);
+    }
+}
+

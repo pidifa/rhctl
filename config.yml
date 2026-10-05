@@ -31,9 +31,9 @@ configs:
       ASSETS_ROOT: "/mnt/c/Users/saidake/Desktop/DevProjects/rhctl/assets"
 
     runs:
-      - type: upload
-        transfer-file: "config/path-mapping.properties"
-        # transfers:
+      - type: transfer
+        upload-mapping: "config/path-mapping.properties"
+        # uploads:
         #   - "${ASSETS_ROOT}/example1.txt=~/examples"
 
       - type: patch
@@ -48,6 +48,10 @@ configs:
           - "${ASSETS_ROOT}/example-bash1.sh"
           - "${ASSETS_ROOT}/example-bash2.sh"
         mode: sync
+        # Optional: all three env keys are required together (no default env file)
+        # env-extract-regex: ['\[INFO\][[:space:]]+DATABASE_URL=(.*)']
+        # env-name: ["DB_URL"]
+        # env-write-file: "/etc/myapp/.env"
 
 # Common configuration (Optional)
 # Applies to all servers unless overridden in individual server or command configs.

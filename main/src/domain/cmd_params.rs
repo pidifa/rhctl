@@ -135,9 +135,13 @@ pub struct ExecuteCmdConfig {
     /// Paired with `env_names` by index. Each regex needs one capture group.
     #[serde(default, skip)]
     pub env_extract_regexes: Vec<String>,
-    /// Paired with `env_extract_regexes` by index. Written to remote `/etc/rhctl/.env`.
+    /// Paired with `env_extract_regexes` by index.
     #[serde(default, skip)]
     pub env_names: Vec<String>,
+    /// Remote env file that receives the extracted values (no default). Required
+    /// together with `env_extract_regexes`; supports `~` and `${VAR}`.
+    #[serde(default, skip)]
+    pub env_write_file: Option<String>,
 
     pub mode: String,
     pub work_path: String,
