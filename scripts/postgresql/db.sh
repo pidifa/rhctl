@@ -1,4 +1,3 @@
-```bash
 #!/bin/bash
 # ****************************************************************************************************
 # Copyright (C) 2022-2026 rhctl Contributors
@@ -582,4 +581,3 @@ echo "[INFO]   DATABASE_URL=postgres://${DB_USER}:${DB_PASSWORD_URL}@${DB_CONNEC
 echo "[INFO] Test:"
 echo "[INFO]   PGPASSWORD='${DB_PASSWORD}' psql -U ${DB_USER} -d ${DB_NAME} -h ${DB_CONNECT_HOST} -p ${RHCTL_PG_PORT}"
 echo "============================================="
-```

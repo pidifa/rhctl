@@ -10,7 +10,10 @@
 # Does not create databases or roles — use db.sh --action create.
 #
 # Remote pg_hba access requires --allowed-ips; without it, only local
-# 127.0.0.1 / ::1 rules remain.
+# 127.0.0.1 / ::1 TCP connections remain.
+#
+# Local administrative access always uses PostgreSQL peer authentication
+# through the Unix socket.
 #
 # If exists, overwrite — safe to re-run.
 #
@@ -29,13 +32,15 @@
 #       Listen port (default: `5432`).
 #         Example port values: `5432`, `5433`, `48985`
 #   --auth-method <method>
-#       pg_hba auth method (default: `md5`).
-#         Example method values: `md5`, `scram-sha-256`, `password`
+#       pg_hba auth method for TCP connections (default: `md5`).
+#         Example method values: `md5`, `scram-sha-256`, `password`,
+#         `trust`, `reject`
 #   --allowed-ips <ip>[,<ip>...]
-#       Remote pg_hba allow-list; re-runs overwrite prior remote host-all rules.
-#       When omitted, remote rules are cleared (local `127.0.0.1` / `::1` only).
-#         Example ip values: `192.168.1.100`, `10.0.0.5`, `192.168.1.0/24`,
-#           `0.0.0.0/0`, `::/0`
+#       Remote pg_hba allow-list.
+#       Re-runs overwrite prior remote host-all rules.
+#       When omitted, only local 127.0.0.1 / ::1 TCP rules remain.
+#         Example ip values: `192.168.1.100`, `10.0.0.5`,
+#           `192.168.1.0/24`, `0.0.0.0/0`, `::/0`
 #
 # Override Parameters:
 #   RHCTL_PG_PORT=<port>
@@ -46,7 +51,7 @@
 #       Same as `--allowed-ips`.
 #
 # Since : 1.0.3
-# Date  : Sep 27, 2026
+# Date  : Oct 6, 2026
 # ************************************************************************************
 
 set -euo pipefail
@@ -55,32 +60,50 @@ set -euo pipefail
 
 RHCTL_PG_PORT="${RHCTL_PG_PORT:-5432}"
 RHCTL_PG_AUTH_METHOD="${RHCTL_PG_AUTH_METHOD:-md5}"
+
 NEED_RESTART=false
 IPS=()
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --port)
+            if [ "$#" -lt 2 ]; then
+                echo "[ERROR] Missing value for --port"
+                exit 1
+            fi
             RHCTL_PG_PORT="$2"
             shift 2
             ;;
+
         --auth-method)
+            if [ "$#" -lt 2 ]; then
+                echo "[ERROR] Missing value for --auth-method"
+                exit 1
+            fi
             RHCTL_PG_AUTH_METHOD="$2"
             shift 2
             ;;
+
         --allowed-ips)
+            if [ "$#" -lt 2 ]; then
+                echo "[ERROR] Missing value for --allowed-ips"
+                exit 1
+            fi
             IFS=',' read -r -a _parsed <<<"$2"
             IPS+=("${_parsed[@]}")
             shift 2
             ;;
+
         -h|--help)
-            sed -n '2,50p' "$0"
+            sed -n '2,61p' "$0"
             exit 0
             ;;
+
         --*)
             echo "[ERROR] Unknown option: $1"
             exit 1
             ;;
+
         *)
             IPS+=("$1")
             shift
@@ -93,7 +116,8 @@ if [ "${#IPS[@]}" -eq 0 ] && [ -n "${RHCTL_PG_ALLOW_IPS:-}" ]; then
 fi
 
 case "$RHCTL_PG_AUTH_METHOD" in
-    md5|scram-sha-256|password|trust|reject) ;;
+    md5|scram-sha-256|password|trust|reject)
+        ;;
     *)
         echo "[ERROR] Unsupported --auth-method: ${RHCTL_PG_AUTH_METHOD}"
         echo "[ERROR] Allowed: md5, scram-sha-256, password, trust, reject"
@@ -103,8 +127,13 @@ esac
 
 # ========================================================================= Methods
 
-log() { echo "[INFO] $*"; }
-warn() { echo "[WARN] $*"; }
+log() {
+    echo "[INFO] $*"
+}
+
+warn() {
+    echo "[WARN] $*"
+}
 
 set_conf_kv() {
     local key="$1"
@@ -114,21 +143,30 @@ set_conf_kv() {
     local current
 
     current=$(grep -E "^[[:space:]]*${key}[[:space:]]*=" "$file" | head -1 || true)
+
     if [ -n "$current" ]; then
         local normalized
         normalized=$(echo "$current" \
             | sed 's/^[[:space:]]*//;s/[[:space:]]*=[[:space:]]*/ = /;s/[[:space:]]\+/ /g')
+
         if [ "$normalized" = "$expected" ]; then
             log "postgresql.conf '${key}' already set to ${value}"
             return 1
         fi
-        sudo sed -i -E "s|^[[:space:]]*${key}[[:space:]]*=.*|${expected}|" "$file"
+
+        sudo sed -i -E \
+            "s|^[[:space:]]*${key}[[:space:]]*=.*|${expected}|" \
+            "$file"
+
         log "Updated postgresql.conf '${key}' = ${value}"
         return 0
     fi
 
     if grep -qE "^[[:space:]]*#[[:space:]]*${key}[[:space:]]*=" "$file"; then
-        sudo sed -i -E "s|^[[:space:]]*#[[:space:]]*${key}[[:space:]]*=.*|${expected}|" "$file"
+        sudo sed -i -E \
+            "s|^[[:space:]]*#[[:space:]]*${key}[[:space:]]*=.*|${expected}|" \
+            "$file"
+
         log "Uncommented postgresql.conf '${key}' = ${value}"
         return 0
     fi
@@ -140,6 +178,7 @@ set_conf_kv() {
 
 normalize_cidr() {
     local ip="$1"
+
     if [[ "$ip" != */* ]]; then
         echo "${ip}/32"
     else
@@ -147,45 +186,131 @@ normalize_cidr() {
     fi
 }
 
+# ========================================================================= pg_hba helpers
+
+# Remove managed TCP host-all rules for localhost and remote addresses.
+#
+# We intentionally manage only:
+#
+#   host all all 127.0.0.1/32 ...
+#   host all all ::1/128 ...
+#   host all all <remote-cidr> ...
+#
+# Other pg_hba rules are left untouched.
+remove_managed_host_rules() {
+    sudo sed -i -E \
+        '/^[[:space:]]*host[[:space:]]+all[[:space:]]+all[[:space:]]+(127\.0\.0\.1\/32|::1\/128)([[:space:]]|$)/d' \
+        "$HBA_FILE"
+}
+
 remote_hba_snapshot() {
-    sudo grep -E '^host[[:space:]]+all[[:space:]]+all[[:space:]]+' "$HBA_FILE" 2>/dev/null \
-        | grep -Ev '[[:space:]](127\.0\.0\.1/32|::1/128)[[:space:]]' || true
+    sudo grep -E \
+        '^[[:space:]]*host[[:space:]]+all[[:space:]]+all[[:space:]]+' \
+        "$HBA_FILE" 2>/dev/null \
+        | grep -Ev \
+        '[[:space:]](127\.0\.0\.1/32|::1/128)([[:space:]]|$)' \
+        || true
 }
 
 remove_remote_hba_rules() {
     sudo sed -i -E \
-        '/^host[[:space:]]+all[[:space:]]+all[[:space:]]+(127\.0\.0\.1\/32|::1\/128)[[:space:]]+/b
-         /^host[[:space:]]+all[[:space:]]+all[[:space:]]+/d' \
+        '/^[[:space:]]*host[[:space:]]+all[[:space:]]+all[[:space:]]+(127\.0\.0\.1\/32|::1\/128)([[:space:]]|$)/b
+         /^[[:space:]]*host[[:space:]]+all[[:space:]]+all[[:space:]]+/d' \
         "$HBA_FILE"
+}
+
+ensure_local_hba_rules() {
+    local before after
+
+    before="$(
+        sudo grep -E \
+            '^[[:space:]]*host[[:space:]]+all[[:space:]]+all[[:space:]]+(127\.0\.0\.1\/32|::1\/128)([[:space:]]|$)' \
+            "$HBA_FILE" 2>/dev/null \
+            || true
+    )"
+
+    # Remove existing managed localhost host rules first so that
+    # re-runs produce exactly one canonical rule for each address.
+    remove_managed_host_rules
+
+    {
+        echo "host    all             all             127.0.0.1/32          ${AUTH}"
+        echo "host    all             all             ::1/128               ${AUTH}"
+    } | sudo tee -a "$HBA_FILE" >/dev/null
+
+    after="$(
+        sudo grep -E \
+            '^[[:space:]]*host[[:space:]]+all[[:space:]]+all[[:space:]]+(127\.0\.0\.1\/32|::1\/128)([[:space:]]|$)' \
+            "$HBA_FILE" 2>/dev/null \
+            || true
+    )"
+
+    if [ "$before" != "$after" ]; then
+        return 0
+    fi
+
+    return 1
 }
 
 sync_remote_hba_allowlist() {
     local -a desired=("$@")
     local before after cidr line
+
     before="$(remote_hba_snapshot)"
+
+    # Remove all remote host-all rules while preserving/recreating
+    # localhost rules separately.
     remove_remote_hba_rules
+
     for cidr in "${desired[@]}"; do
         line="host    all             all             ${cidr}               ${AUTH}"
         echo "$line" | sudo tee -a "$HBA_FILE" >/dev/null
         log "pg_hba allow: ${cidr} (${AUTH})"
     done
+
     after="$(remote_hba_snapshot)"
+
     if [ "$before" != "$after" ]; then
         return 0
     fi
+
     return 1
 }
 
+configure_pg_hba() {
+    local local_changed remote_changed
+
+    local_changed=false
+    remote_changed=false
+
+    if ensure_local_hba_rules; then
+        local_changed=true
+    fi
+
+    if sync_remote_hba_allowlist "${DESIRED_CIDRS[@]}"; then
+        remote_changed=true
+    fi
+
+    if [ "$local_changed" = true ] || [ "$remote_changed" = true ]; then
+        NEED_RESTART=true
+    fi
+}
+
+# ========================================================================= Firewall
+
 configure_firewall() {
     local port="$1"
+
     if ! command -v ufw &>/dev/null; then
         log "ufw not installed — skipping firewall"
         return 0
     fi
+
     if sudo ufw status 2>/dev/null | grep -qE "(${port}/tcp|${port}\\s)"; then
         log "Firewall rule for ${port}/tcp already exists"
         return 0
     fi
+
     sudo ufw allow "${port}/tcp" comment 'PostgreSQL (rhctl)'
     log "Allowed ${port}/tcp in ufw"
 }
@@ -244,16 +369,18 @@ fi
 
 AUTH="$RHCTL_PG_AUTH_METHOD"
 
-# ========================================================================= remote pg_hba
+# ========================================================================= pg_hba
 
 DESIRED_CIDRS=()
 ALLOW_IPS_EXPLICIT=false
 
 if [ "${#IPS[@]}" -gt 0 ]; then
     ALLOW_IPS_EXPLICIT=true
+
     for raw in "${IPS[@]}"; do
         ip="$(echo "$raw" | xargs)"
         [ -z "$ip" ] && continue
+
         DESIRED_CIDRS+=("$(normalize_cidr "$ip")")
     done
 fi
@@ -264,12 +391,12 @@ if [ "$ALLOW_IPS_EXPLICIT" = true ] && [ "${#DESIRED_CIDRS[@]}" -eq 0 ]; then
 fi
 
 if [ "${#DESIRED_CIDRS[@]}" -eq 0 ]; then
-    log "No --allowed-ips — clearing remote pg_hba rules (local only)"
+    log "No --allowed-ips — allowing local TCP access only"
+else
+    log "Configuring remote pg_hba allow-list"
 fi
 
-if sync_remote_hba_allowlist "${DESIRED_CIDRS[@]}"; then
-    NEED_RESTART=true
-fi
+configure_pg_hba
 
 # ========================================================================= firewall
 
@@ -279,6 +406,7 @@ configure_firewall "$RHCTL_PG_PORT"
 
 if [ "$NEED_RESTART" = true ]; then
     log "Restarting PostgreSQL to apply configuration"
+
     if ! sudo systemctl restart postgresql; then
         echo "[ERROR] Failed to restart PostgreSQL"
         sudo systemctl status postgresql --no-pager || true
@@ -287,6 +415,7 @@ if [ "$NEED_RESTART" = true ]; then
 else
     if ! systemctl is-active --quiet postgresql; then
         warn "PostgreSQL service is not active — attempting start"
+
         if ! sudo systemctl start postgresql; then
             echo "[ERROR] Failed to start PostgreSQL"
             sudo systemctl status postgresql --no-pager || true
@@ -307,15 +436,18 @@ fi
 log "Waiting for PostgreSQL on 127.0.0.1:${RHCTL_PG_PORT}"
 
 READY=false
+
 for _ in $(seq 1 30); do
     if pg_isready \
         -h 127.0.0.1 \
         -p "$RHCTL_PG_PORT" \
         -d postgres \
         >/dev/null 2>&1; then
+
         READY=true
         break
     fi
+
     sleep 1
 done
 
@@ -339,6 +471,7 @@ log "PostgreSQL is accepting connections on 127.0.0.1:${RHCTL_PG_PORT}"
 # ========================================================================= Verify runtime configuration
 
 RUNTIME_PORT="$(
+    PGCONNECT_TIMEOUT=5 \
     sudo -u postgres psql \
         -p "$RHCTL_PG_PORT" \
         -d postgres \
@@ -347,6 +480,7 @@ RUNTIME_PORT="$(
 )"
 
 RUNTIME_LISTEN="$(
+    PGCONNECT_TIMEOUT=5 \
     sudo -u postgres psql \
         -p "$RHCTL_PG_PORT" \
         -d postgres \
@@ -369,11 +503,13 @@ log "Runtime port=${RUNTIME_PORT}"
 echo "============================================="
 echo "[INFO] PostgreSQL server configured"
 echo "[INFO]   LISTEN=* PORT=${RHCTL_PG_PORT} AUTH=${AUTH}"
+
 if [ "${#DESIRED_CIDRS[@]}" -gt 0 ]; then
     echo "[INFO]   ALLOW_IPS=${DESIRED_CIDRS[*]}"
 else
     echo "[INFO]   ALLOW_IPS=(none — local 127.0.0.1 / ::1 only)"
 fi
+
 echo "[INFO] Next: create a database with"
 echo "[INFO]   ./db.sh --action create --port ${RHCTL_PG_PORT}"
 echo "============================================="
