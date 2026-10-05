@@ -164,11 +164,11 @@ if [ -n "${SUDO_USER}" ] && [ -d "/home/${SUDO_USER}" ]; then
 fi
 
 # iptables / network leftovers (best effort)
-iptables -F 2>/dev/null || true
-iptables -t nat -F 2>/dev/null || true
-iptables -t mangle -F 2>/dev/null || true
-ip6tables -F 2>/dev/null || true
-ip6tables -t nat -F 2>/dev/null || true
+# iptables -F 2>/dev/null || true
+# iptables -t nat -F 2>/dev/null || true
+# iptables -t mangle -F 2>/dev/null || true
+# ip6tables -F 2>/dev/null || true
+# ip6tables -t nat -F 2>/dev/null || true
 
 # ========================================================================= Final output
 

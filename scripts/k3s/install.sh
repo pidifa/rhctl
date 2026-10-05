@@ -10,7 +10,7 @@
 # If exists, skip — safe to re-run.
 #
 # Usage:
-#   ./install-k3s.sh
+#   ./install.sh
 #
 # Required Parameters:
 #   (none)
