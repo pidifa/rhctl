@@ -456,6 +456,27 @@ servers:
     password: "testpwd"
     connect_timeout: 60s  
 
+# Common configuration (Optional)
+# Applies to all servers unless overridden in individual server or command configs.
+common:
+  server:
+    connect_timeout: 60s  
+    max_channels_per_session: 200
+    max_sessions_per_server: 2000
+    session_acquire_timeout: 30s
+    max_session_lifetime: 10m
+
+# Global variables  (Optional)
+# Provide values for ${VAR_NAME} placeholders in paths.
+# Entries here are overridden by the same name in a config's var-map.
+var-map:
+  ASSETS_ROOT: "/path/to/assets"
+
+# Group mapping  (Optional)
+# Assign servers to logical groups for easier targeting
+group-map:
+  dev: ["test-server1", "test-server2"]
+  
 # Command configurations — ordered pipeline under `runs:`
 configs:   
   - name: "dev-deploy"   
@@ -499,26 +520,7 @@ configs:
         # env-name: ["DB_URL"]
         # env-write-file: "/etc/myapp/.env"
 
-# Common configuration (Optional)
-# Applies to all servers unless overridden in individual server or command configs.
-common:
-  server:
-    connect_timeout: 60s  
-    max_channels_per_session: 200
-    max_sessions_per_server: 2000
-    session_acquire_timeout: 30s
-    max_session_lifetime: 10m
 
-# Global variables  (Optional)
-# Provide values for ${VAR_NAME} placeholders in paths.
-# Entries here are overridden by the same name in a config's var-map.
-var-map:
-  ASSETS_ROOT: "/path/to/assets"
-
-# Group mapping  (Optional)
-# Assign servers to logical groups for easier targeting
-group-map:
-  dev: ["test-server1", "test-server2"]
 ```
 
 **Required Parameters**:

@@ -53,7 +53,81 @@ pub const SUDO_ERR_MSG: &str = "sudo: a password is required";
 pub static DANGEROUS_PATHS: once_cell::sync::Lazy<HashSet<&'static str>> =
     once_cell::sync::Lazy::new(|| {
         HashSet::from([
-            "", "/", "/home", "/root", "/etc", "/usr", "/bin", "/sbin", "/var", "/tmp", "/lib",
-            "/lib64", "/opt", "/dev", "/proc", "/sys", "~",
+            // Root / users
+            "",
+            "/",
+            "/home",
+            "/root",
+
+            // System configuration
+            "/etc",
+            "/etc/systemd",
+            "/etc/systemd/system",
+            "/etc/systemd/user",
+            "/etc/ssh",
+            "/etc/ssh/sshd_config",
+            "/etc/sudoers",
+            "/etc/sudoers.d",
+            "/etc/cron.d",
+            "/etc/cron.daily",
+            "/etc/cron.hourly",
+            "/etc/cron.monthly",
+            "/etc/cron.weekly",
+            
+            // Network
+            "/etc/fstab",     
+            "/etc/crypttab",  
+            "/etc/hostname",
+            "/etc/hosts",
+            "/etc/resolv.conf",
+
+            // Executables / libraries
+            "/usr",
+            "/usr/bin",
+            "/usr/sbin",
+            "/usr/lib",
+            "/usr/lib64",
+            "/bin",
+            "/sbin",
+            "/lib",
+            "/lib64",
+
+            // Runtime / boot
+            "/boot",
+            "/boot/efi",
+            "/dev",
+            "/proc",
+            "/sys",
+            "/run",
+
+            // System state / logs
+            "/var",
+            "/var/lib",
+            "/var/lib/systemd",
+            "/var/lib/dpkg",
+            "/var/lib/rpm",
+            "/var/log",
+
+            // Temporary / mounts
+            "/tmp",
+            "/mnt",
+            "/media",
+            "/opt",
+
+            // Network configuration
+            "/etc/network",
+            "/etc/netplan",
+            "/etc/NetworkManager",
+
+            // Package / service configuration
+            "/etc/default",
+            "/etc/init.d",
+
+            // Shell / environment configuration
+            "/etc/profile",
+            "/etc/profile.d",
+
+            // Wildcard / home shortcut
+            "~",
         ])
     });
