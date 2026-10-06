@@ -1199,18 +1199,9 @@ impl ServerPool {
         use_sudo: bool,
         use_rsync: bool,
         silent: bool,
-        direct_write_if_sudo: bool,
+        _direct_write_if_sudo: bool,
         print_log: bool,
     ) -> Result<(), String> {
-        // println!("upload_file_or_dir_contents_into_dir remote_dir: ---{}---",remote_dir);
-        let mut remote_temp_dir: Option<String> = None;
-        if use_sudo && server_metadata.user != "root" && !direct_write_if_sudo {
-            remote_temp_dir = Some(
-                self.create_remote_temp_dir(server_metadata, task_name, "upload", use_sudo)
-                    .await?,
-            );
-        }
-
         if local_file_or_dir.is_dir() {
             for entry in std::fs::read_dir(local_file_or_dir).map_err(|e| {
                 format!(
@@ -1223,7 +1214,7 @@ impl ServerPool {
                     entry.map_err(|e| format!("Error reading directory entry. \n\t> {}", e))?;
                 let sub_path = entry.path();
                 let base_name = get_local_path_base_name(&sub_path)?;
-                let remote_sub = format!("{}/{}", remote_dir, base_name);
+                let remote_sub = format!("{}/{}", remote_dir, base_name);   
 
                 self.ask_safe_to_transfer(
                     server_metadata,
@@ -1232,43 +1223,20 @@ impl ServerPool {
                     use_sudo,
                     silent,
                 )
-                .await?;
-                if use_sudo && server_metadata.user != "root" && !direct_write_if_sudo {
-                    let temp_dir = remote_temp_dir.as_ref().unwrap();
-                    self.do_upload(
-                        server_metadata,
-                        task_name,
-                        use_sudo,
-                        use_rsync,
-                        &sub_path,
-                        &temp_dir,
-                        new_file_name,
-                    )
-                    .await?;
-                } else {
-                    self.do_upload(
-                        server_metadata,
-                        task_name,
-                        use_sudo,
-                        use_rsync,
-                        &sub_path,
-                        &remote_dir,
-                        new_file_name,
-                    )
-                    .await?;
-                }
-            }
-            if use_sudo && server_metadata.user != "root" && !direct_write_if_sudo {
-                let temp_dir = remote_temp_dir.as_ref().unwrap();
-                self.move_and_delete_temp_dir(
+                .await?;    
+
+                self.do_upload(
                     server_metadata,
                     task_name,
-                    temp_dir,
-                    remote_dir,
                     use_sudo,
+                    use_rsync,
+                    &sub_path,
+                    remote_dir,
+                    new_file_name,
                 )
                 .await?;
-            }
+            }   
+
             if print_log {
                 log_info!(
                     server_metadata,
@@ -1283,41 +1251,28 @@ impl ServerPool {
                 "{}/{}",
                 remote_dir,
                 new_file_name.unwrap_or(get_local_path_base_name(&local_file_or_dir)?.as_str())
-            );
-            self.ask_safe_to_transfer(server_metadata, task_name, &remote_file, use_sudo, silent)
-                .await?;
-            if use_sudo && server_metadata.user != "root" && !direct_write_if_sudo {
-                let temp_dir = remote_temp_dir.as_ref().unwrap();
-                self.do_upload(
-                    server_metadata,
-                    task_name,
-                    use_sudo,
-                    use_rsync,
-                    &local_file_or_dir,
-                    &temp_dir,
-                    new_file_name,
-                )
-                .await?;
-                self.move_and_delete_temp_dir(
-                    server_metadata,
-                    task_name,
-                    temp_dir,
-                    remote_dir,
-                    use_sudo,
-                )
-                .await?;
-            } else {
-                self.do_upload(
-                    server_metadata,
-                    task_name,
-                    use_sudo,
-                    use_rsync,
-                    &local_file_or_dir,
-                    &remote_dir,
-                    new_file_name,
-                )
-                .await?;
-            }
+            );  
+
+            self.ask_safe_to_transfer(
+                server_metadata,
+                task_name,
+                &remote_file,
+                use_sudo,
+                silent,
+            )
+            .await?;    
+
+            self.do_upload(
+                server_metadata,
+                task_name,
+                use_sudo,
+                use_rsync,
+                local_file_or_dir,
+                remote_dir,
+                new_file_name,
+            )
+            .await?;    
+
             if print_log {
                 log_info!(
                     server_metadata,
@@ -1327,11 +1282,10 @@ impl ServerPool {
                     remote_file
                 );
             }
-        }
+        }   
 
         Ok(())
     }
-
     pub async fn upload_file_to_file(
         &self,
         server_metadata: &Arc<ServerMetadata>,
@@ -1499,6 +1453,7 @@ impl ServerPool {
                 )
             })?;
         }
+
         if !local_dir.is_dir() {
             return Err(format!(
                 "Local download target '{}' is not a directory",
@@ -1506,91 +1461,32 @@ impl ServerPool {
             ));
         }
 
-        let mut remote_source = remote_file_or_dir.to_string();
-        let mut remote_temp_dir: Option<String> = None;
-
-        if use_sudo && server_metadata.user != "root" {
-            let temp_dir = self
-                .create_remote_temp_dir(server_metadata, task_name, "download", use_sudo)
-                .await?;
-            let quoted_source = shlex::try_quote(remote_file_or_dir)
-                .map_err(|e| format!("Invalid remote path '{}': {}", remote_file_or_dir, e))?;
-            let quoted_temp = shlex::try_quote(&temp_dir)
-                .map_err(|e| format!("Invalid remote temp path '{}': {}", temp_dir, e))?;
-            self.exec(
+        let source_is_dir = self
+            .dir_exists(
                 server_metadata,
                 task_name,
-                &format!("cp -a {} {}/", quoted_source, quoted_temp),
+                remote_file_or_dir,
                 use_sudo,
             )
             .await?;
-            let base = self
-                .exec(
-                    server_metadata,
-                    task_name,
-                    &format!("basename -- {}", quoted_source),
-                    use_sudo,
-                )
-                .await?
-                .trim()
-                .to_string();
-            if base.is_empty() || base == "." || base == ".." {
-                return Err(format!(
-                    "Failed to determine basename of remote path '{}'",
-                    remote_file_or_dir
-                ));
-            }
-            remote_source = format!("{}/{}", temp_dir, base);
-            self.exec(
-                server_metadata,
-                task_name,
-                &format!(
-                    "chown -R {} {}",
-                    shlex::try_quote(&server_metadata.user)
-                        .map_err(|e| format!("Invalid username: {}", e))?,
-                    quoted_temp
-                ),
-                true,
-            )
-            .await?;
-            remote_temp_dir = Some(temp_dir);
-        }
 
-        let source_is_dir = self
-            .dir_exists(server_metadata, task_name, &remote_source, use_sudo)
-            .await?;
-        let result = self
-            .do_download(
-                server_metadata,
-                task_name,
-                &remote_source,
-                local_dir,
-                use_rsync && remote_temp_dir.is_none(),
-                source_is_dir,
-                silent,
-            )
-            .await;
+        // A non-root sudo download cannot use local rsync directly because the
+        // remote rsync process would need elevated permissions. Use direct SCP.
+        let use_rsync = use_rsync
+            && !(use_sudo && server_metadata.user != "root");
 
-        if let Some(temp_dir) = remote_temp_dir {
-            let cleanup = self
-                .exec(
-                    server_metadata,
-                    task_name,
-                    &format!("rm -rf {}", shlex::try_quote(&temp_dir).unwrap()),
-                    true,
-                )
-                .await;
-            if let Err(e) = cleanup {
-                if result.is_ok() {
-                    return Err(format!(
-                        "Download succeeded but remote temporary directory cleanup failed: {}",
-                        e
-                    ));
-                }
-            }
-        }
+        self.do_download(
+            server_metadata,
+            task_name,
+            remote_file_or_dir,
+            local_dir,
+            use_rsync,
+            source_is_dir,
+            silent,
+            use_sudo
+        )
+        .await?;
 
-        result?;
         if print_log {
             log_info!(
                 server_metadata,
@@ -1600,6 +1496,7 @@ impl ServerPool {
                 local_dir.display()
             );
         }
+
         Ok(())
     }
 
@@ -1612,6 +1509,7 @@ impl ServerPool {
         use_rsync: bool,
         source_is_dir: bool,
         silent: bool,
+        use_sudo: bool,
     ) -> Result<(), String> {
         let stage_dir = std::env::temp_dir().join(format!(
             "rhctl-download-{}-{}",
@@ -1629,7 +1527,10 @@ impl ServerPool {
             )
         })?;
 
-        let result = if use_rsync && self.command_exists("rsync") {
+        let result = if use_rsync
+            && self.command_exists("rsync")
+            && !(use_sudo && server_metadata.user != "root")
+        {
             self.do_download_with_rsync(
                 server_metadata,
                 task_name,
@@ -1645,6 +1546,7 @@ impl ServerPool {
                 remote_source,
                 &stage_dir,
                 source_is_dir,
+                use_sudo
             )
             .await
         };
@@ -1737,13 +1639,33 @@ impl ServerPool {
         remote_source: &str,
         stage_dir: &Path,
         source_is_dir: bool,
+        use_sudo: bool
     ) -> Result<(), String> {
+        if use_sudo && server_metadata.user != "root" {
+            // Authenticate sudo first using the normal PTY-aware command path.
+            // The actual SCP protocol then runs with `sudo -n`, so the password
+            // prompt never becomes part of the SCP byte stream.
+            self.exec(server_metadata, task_name, "true", true)
+                .await
+                .map_err(|e| {
+                    format!("Failed to authenticate sudo for SCP download: {}", e)
+                })?;
+        }
+
         let quoted_source = shlex::try_quote(remote_source)
             .map_err(|e| format!("Invalid remote path '{}': {}", remote_source, e))?;
+
         let mut channel_guard = self.get_channel(server_metadata).await?;
+
         // Directories require recursive mode, otherwise the remote sender
         // fails with `scp: <path>: not a regular file`.
-        let command = if source_is_dir {
+        let command = if use_sudo && server_metadata.user != "root" {
+            if source_is_dir {
+                format!("sudo -n scp -r -f {}", quoted_source)
+            } else {
+                format!("sudo -n scp -f {}", quoted_source)
+            }
+        } else if source_is_dir {
             format!("scp -r -f {}", quoted_source)
         } else {
             format!("scp -f {}", quoted_source)
@@ -2183,9 +2105,28 @@ impl ServerPool {
                 .map_err(|e| format!("Failed to stat local file {:?}: {}", local_file_or_dir, e))?;
             let file_size = metadata.len();
 
-            // Enable scp receiver
-            let scp_cmd = format!("scp -t {}", remote_target);
-            let mut channel_guard = self.get_channel(&server_metadata).await?;
+        // Authenticate sudo through the normal PTY-aware command path first.
+        // Then use `sudo -n` for the binary SCP protocol so sudo's password
+        // prompt never gets mixed into SCP protocol bytes.
+        if use_sudo && server_metadata.user != "root" {
+            self.exec(server_metadata, task_name, "true", true)
+                .await
+                .map_err(|e| {
+                    format!("Failed to authenticate sudo for SCP upload: {}", e)
+                })?;
+        }       
+
+        let quoted_target = shlex::try_quote(&remote_target)
+            .map_err(|e| format!("Invalid remote target '{}': {}", remote_target, e))?;     
+
+        let scp_cmd = if use_sudo && server_metadata.user != "root" {
+            format!("sudo -n scp -t {}", quoted_target)
+        } else {
+            format!("scp -t {}", quoted_target)
+        };      
+
+        let mut channel_guard = self.get_channel(server_metadata).await?;
+
             channel_guard
                 .channel
                 .exec(true, scp_cmd.as_bytes().to_vec())
@@ -2290,7 +2231,12 @@ impl ServerPool {
             remote_dir
         );
 
-        if use_rsync && self.command_exists("rsync") {
+        // rsync cannot use our sudo authentication flow for a non-root remote user.
+        // Use direct SCP instead so the remote SCP process itself runs under sudo.
+        if use_rsync
+            && self.command_exists("rsync")
+            && !(use_sudo && server_metadata.user != "root")
+        {
             log_debug!(server_metadata, task_name, "Using rsync for upload");
             let remote_target = if let Some(name) = new_file_name {
                 format!("{}/{}", remote_dir, name)
