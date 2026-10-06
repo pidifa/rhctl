@@ -15,7 +15,7 @@ use crate::domain::constants::{
     SUDO_ERR_MSG, SYSTEM_TASK_NAME,
 };
 use crate::domain::yml_config::ServerConfig;
-use crate::utils::file_utils::{expand_local_user_path, generate_remote_temp_dir, get_local_path_base_name};
+use crate::utils::file_utils::{expand_local_user_path, generate_remote_temp_dir, get_local_path_base_name, split_unix_path};
 use crate::utils::log_utils::ask_user;
 use crate::utils::ssh_utils::{feed_remote_stream, CrProgressPrinter};
 use crate::{log_debug, log_error_direct, log_info, log_warn, log_warn_direct};
@@ -54,6 +54,13 @@ pub enum SshError {
     Russh(russh::Error),
     Io(io::Error),
     Custom(String),
+}
+
+/// Remote path kind used by the transfer path-mapping rules.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemotePathKind {
+    File,
+    Dir,
 }
 
 impl From<russh::Error> for SshError {
@@ -761,6 +768,39 @@ impl ServerPool {
             .await
     }
 
+    /// Classify a remote path as file / directory / missing with a single probe.
+    /// Anything existing but neither file nor dir (socket, fifo, device, ...)
+    /// is reported as an error so callers fail loudly instead of guessing.
+    pub async fn remote_path_kind(
+        &self,
+        server_metadata: &Arc<ServerMetadata>,
+        task_name: &str,
+        path: &str,
+        use_sudo: bool,
+    ) -> Result<Option<RemotePathKind>, String> {
+        let escaped = path.replace('\'', "'\\''");
+        let probe = format!(
+            "if [ -d '{p}' ]; then echo __RHCTL_DIR__; elif [ -f '{p}' ]; then echo __RHCTL_FILE__; elif [ -e '{p}' ]; then echo __RHCTL_OTHER__; else echo __RHCTL_MISSING__; fi",
+            p = escaped
+        );
+        let out = self
+            .exec(server_metadata, task_name, &probe, use_sudo)
+            .await?;
+        match out.trim() {
+            "__RHCTL_DIR__" => Ok(Some(RemotePathKind::Dir)),
+            "__RHCTL_FILE__" => Ok(Some(RemotePathKind::File)),
+            "__RHCTL_MISSING__" => Ok(None),
+            "__RHCTL_OTHER__" => Err(format!(
+                "Remote path '{}' exists but is neither a file nor a directory",
+                path
+            )),
+            other => Err(format!(
+                "Failed to check remote path '{}' (unexpected output '{}')",
+                path, other
+            )),
+        }
+    }
+
     /// Check if any files or directories in `dir_path` match the given `pattern`
     pub async fn dir_has_pattern(
         &self,
@@ -1292,6 +1332,153 @@ impl ServerPool {
         Ok(())
     }
 
+    pub async fn upload_file_to_file(
+        &self,
+        server_metadata: &Arc<ServerMetadata>,
+        task_name: &str,
+        local_file: &Path,
+        remote_file: &str,
+        use_sudo: bool,
+        use_rsync: bool,
+        silent: bool,
+    ) -> Result<(), String> {
+        if !local_file.is_file() {
+            return Err(format!(
+                "Local file '{}' does not exist or is not a file",
+                local_file.display()
+            ));
+        }
+        // Overwrite confirmation keeps existing logic (ask then delete).
+        self.ask_safe_to_transfer(server_metadata, task_name, remote_file, use_sudo, silent)
+            .await?;
+        // `do_upload` copies into a directory; split exact file target into
+        // parent dir + new file name so both scp and rsync keep working.
+        // `split_unix_path` returns (basename, parent).
+        let (name, parent) = split_unix_path(remote_file)?;
+        let parent = if parent.is_empty() { "/".to_string() } else { parent };
+        self.create_remote_dir_if_not_exists(server_metadata, task_name, &parent, use_sudo)
+            .await?;
+        let file_name = name.clone();
+        self.upload_file_or_dir_contents_into_dir_silent(
+            server_metadata,
+            task_name,
+            local_file,
+            &parent,
+            Some(&file_name),
+            use_sudo,
+            use_rsync,
+        )
+        .await?;
+        log_info!(
+            server_metadata,
+            task_name,
+            "Successfully uploaded the file '{}' to '{}'",
+            local_file.display(),
+            remote_file
+        );
+        Ok(())
+    }
+
+    pub async fn upload_dir_replace_dir(
+        &self,
+        server_metadata: &Arc<ServerMetadata>,
+        task_name: &str,
+        local_dir: &Path,
+        remote_dir: &str,
+        use_sudo: bool,
+        use_rsync: bool,
+        silent: bool,
+    ) -> Result<(), String> {
+        if !local_dir.is_dir() {
+            return Err(format!(
+                "Local directory '{}' does not exist or is not a directory",
+                local_dir.display()
+            ));
+        }
+        // dir -> dir: replace the target directory (confirm first).
+        self.ask_safe_to_transfer(server_metadata, task_name, remote_dir, use_sudo, silent)
+            .await?;
+        self.upload_dir_to_new_path(
+            server_metadata,
+            task_name,
+            local_dir,
+            remote_dir,
+            use_sudo,
+            use_rsync,
+            true,
+        )
+        .await
+    }
+
+    pub async fn upload_dir_to_new_path(
+        &self,
+        server_metadata: &Arc<ServerMetadata>,
+        task_name: &str,
+        local_dir: &Path,
+        remote_dir: &str,
+        use_sudo: bool,
+        use_rsync: bool,
+        silent: bool,
+    ) -> Result<(), String> {
+        if !local_dir.is_dir() {
+            return Err(format!(
+                "Local directory '{}' does not exist or is not a directory",
+                local_dir.display()
+            ));
+        }
+        // dir -> non-existent: create a new directory at the target path,
+        // then merge the source contents into it. Silent inner call: the
+        // fresh directory was just created, no overwrite to confirm.
+        self.create_remote_dir_if_not_exists(server_metadata, task_name, remote_dir, use_sudo)
+            .await?;
+        self.upload_file_or_dir_contents_into_dir_silent(
+            server_metadata,
+            task_name,
+            local_dir,
+            remote_dir,
+            None,
+            use_sudo,
+            use_rsync,
+        )
+        .await?;
+        let _ = silent;
+        log_info!(
+            server_metadata,
+            task_name,
+            "Successfully uploaded the contents of the folder '{}' into '{}'",
+            local_dir.display(),
+            remote_dir
+        );
+        Ok(())
+    }
+
+    /// Same as `upload_file_or_dir_contents_into_dir` but skips the per-child
+    /// overwrite prompt. Used after the caller already confirmed once.
+    async fn upload_file_or_dir_contents_into_dir_silent(
+        &self,
+        server_metadata: &Arc<ServerMetadata>,
+        task_name: &str,
+        local_file_or_dir: &Path,
+        remote_dir: &str,
+        new_file_name: Option<&str>,
+        use_sudo: bool,
+        use_rsync: bool,
+    ) -> Result<(), String> {
+        self.upload_file_or_dir_contents_into_dir(
+            server_metadata,
+            task_name,
+            local_file_or_dir,
+            remote_dir,
+            new_file_name,
+            use_sudo,
+            use_rsync,
+            true,
+            false,
+            false,
+        )
+        .await
+    }
+
     pub async fn download_file_or_dir_contents_into_dir(
         &self,
         server_metadata: &Arc<ServerMetadata>,
@@ -1370,7 +1557,7 @@ impl ServerPool {
         }
 
         let source_is_dir = self
-            .dir_exists(server_metadata, task_name, &remote_source, false)
+            .dir_exists(server_metadata, task_name, &remote_source, use_sudo)
             .await?;
         let result = self
             .do_download(
@@ -1443,8 +1630,14 @@ impl ServerPool {
         })?;
 
         let result = if use_rsync && self.command_exists("rsync") {
-            self.do_download_with_rsync(server_metadata, task_name, remote_source, &stage_dir)
-                .await
+            self.do_download_with_rsync(
+                server_metadata,
+                task_name,
+                remote_source,
+                &stage_dir,
+                source_is_dir,
+            )
+            .await
         } else {
             self.do_download_with_scp(
                 server_metadata,
@@ -1473,10 +1666,25 @@ impl ServerPool {
         task_name: &str,
         remote_source: &str,
         stage_dir: &Path,
+        source_is_dir: bool,
     ) -> Result<(), String> {
+        // Directory sources must merge CONTENTS into the staging dir (same as
+        // the scp path). Without the trailing `/`, rsync would nest the
+        // source dir inside staging and `merge_download_stage` would see an
+        // unexpected layout.
+        let remote_arg = if source_is_dir {
+            let trimmed = remote_source.trim_end_matches('/');
+            if trimmed.is_empty() {
+                "/.".to_string()
+            } else {
+                format!("{}/.", trimmed)
+            }
+        } else {
+            remote_source.to_string()
+        };
         let remote_spec = format!(
             "{}@{}:{}",
-            server_metadata.user, server_metadata.host, remote_source
+            server_metadata.user, server_metadata.host, remote_arg
         );
         let status = if let Some(ref identity_file) = server_metadata.identity_file {
             let identity_path = expand_local_user_path(identity_file);
@@ -1533,7 +1741,13 @@ impl ServerPool {
         let quoted_source = shlex::try_quote(remote_source)
             .map_err(|e| format!("Invalid remote path '{}': {}", remote_source, e))?;
         let mut channel_guard = self.get_channel(server_metadata).await?;
-        let command = format!("scp -f {}", quoted_source);
+        // Directories require recursive mode, otherwise the remote sender
+        // fails with `scp: <path>: not a regular file`.
+        let command = if source_is_dir {
+            format!("scp -r -f {}", quoted_source)
+        } else {
+            format!("scp -f {}", quoted_source)
+        };
         channel_guard
             .channel
             .exec(true, command.as_bytes().to_vec())
@@ -1653,6 +1867,12 @@ impl ServerPool {
                     let msg = self.scp_read_line(channel, pending).await?;
                     return Err(format!("SCP remote error {}: {}", code, msg));
                 }
+                // `T<mtime> 0 <atime> 0` precedes the next C/D entry when the
+                // sender preserves timestamps (e.g. `scp -r`): ack and continue.
+                b'T' => {
+                    let _ = self.scp_read_line(channel, pending).await?;
+                    self.scp_send_ack(channel).await?;
+                }
                 b'D' => {
                     let line = self.scp_read_line(channel, pending).await?;
                     let mut parts = line[1..].splitn(2, ' ');
@@ -1678,6 +1898,12 @@ impl ServerPool {
                     }
                     dirs.pop();
                     self.scp_send_ack(channel).await?;
+                    // Popping back to the staging root means the outermost
+                    // directory closed: the sender will only send exit status
+                    // now, so finish instead of looping into it.
+                    if source_is_dir && dirs.len() <= 1 {
+                        return Ok(());
+                    }
                 }
                 b'C' => {
                     let line = self.scp_read_line(channel, pending).await?;
@@ -1706,6 +1932,73 @@ impl ServerPool {
                 other => return Err(format!("Unexpected SCP protocol byte: {}", other)),
             }
         }
+    }
+
+    /// Move a file or directory, falling back to copy+delete when source and
+    /// target live on different filesystems (`rename` gives EXDEV there,
+    /// e.g. staging under /tmp vs target on /mnt/...).
+    fn move_path_fallback_copy(src: &Path, dst: &Path) -> Result<(), String> {
+        match std::fs::rename(src, dst) {
+            Ok(()) => Ok(()),
+            Err(e) if e.raw_os_error() == Some(18) => Self::copy_path_recursive(src, dst)
+                .and_then(|_| Self::remove_path_all(src)),
+            Err(e) => Err(format!(
+                "Failed to move '{}' to '{}': {}",
+                src.display(),
+                dst.display(),
+                e
+            )),
+        }
+    }
+
+    fn copy_path_recursive(src: &Path, dst: &Path) -> Result<(), String> {
+        let md = std::fs::symlink_metadata(src)
+            .map_err(|e| format!("Failed to stat '{}': {}", src.display(), e))?;
+        if md.file_type().is_symlink() {
+            let target = std::fs::read_link(src)
+                .map_err(|e| format!("Failed to read link '{}': {}", src.display(), e))?;
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&target, dst)
+                .map_err(|e| format!("Failed to create symlink '{}': {}", dst.display(), e))?;
+            #[cfg(not(unix))]
+            return Err(format!("Cannot copy symlink '{}' on this platform", src.display()));
+            return Ok(());
+        }
+        if md.is_dir() {
+            std::fs::create_dir_all(dst)
+                .map_err(|e| format!("Failed to create '{}': {}", dst.display(), e))?;
+            for child in std::fs::read_dir(src)
+                .map_err(|e| format!("Failed to read '{}': {}", src.display(), e))?
+            {
+                let child = child.map_err(|e| e.to_string())?;
+                Self::copy_path_recursive(&child.path(), &dst.join(child.file_name()))?;
+            }
+            return Ok(());
+        }
+        if let Some(parent) = dst.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("Failed to create '{}': {}", parent.display(), e))?;
+            }
+        }
+        std::fs::copy(src, dst).map_err(|e| {
+            format!("Failed to copy '{}' to '{}': {}", src.display(), dst.display(), e)
+        })?;
+        Ok(())
+    }
+
+    fn remove_path_all(path: &Path) -> Result<(), String> {
+        if !path.exists() && std::fs::symlink_metadata(path).is_err() {
+            return Ok(());
+        }
+        let md = std::fs::symlink_metadata(path)
+            .map_err(|e| format!("Failed to stat '{}': {}", path.display(), e))?;
+        if md.is_dir() && !md.file_type().is_symlink() {
+            std::fs::remove_dir_all(path)
+        } else {
+            std::fs::remove_file(path)
+        }
+        .map_err(|e| format!("Failed to remove '{}': {}", path.display(), e))
     }
 
     async fn merge_download_stage(
@@ -1754,7 +2047,7 @@ impl ServerPool {
                     }
                     .map_err(|e| format!("Failed to remove '{}': {}", target_child.display(), e))?;
                 }
-                std::fs::rename(child.path(), &target_child).map_err(|e| {
+                Self::move_path_fallback_copy(&child.path(), &target_child).map_err(|e| {
                     format!(
                         "Failed to move downloaded item to '{}': {}",
                         target_child.display(),
@@ -1782,7 +2075,7 @@ impl ServerPool {
                 }
                 .map_err(|e| format!("Failed to remove '{}': {}", target.display(), e))?;
             }
-            std::fs::rename(source, &target).map_err(|e| {
+            Self::move_path_fallback_copy(&source, &target).map_err(|e| {
                 format!(
                     "Failed to move downloaded file to '{}': {}",
                     target.display(),
@@ -2004,9 +2297,22 @@ impl ServerPool {
             } else {
                 remote_dir.to_string()
             };
-            let local_path = local_file_or_dir
+            let local_path_raw = local_file_or_dir
                 .to_str()
                 .ok_or("Invalid local path encoding")?;
+            // Directory sources must merge CONTENTS into the target (same as
+            // the scp path below). Without the trailing `/.`, rsync would
+            // nest the source dir inside the target instead.
+            let local_path = if local_file_or_dir.is_dir() {
+                let trimmed = local_path_raw.trim_end_matches('/');
+                if trimmed.is_empty() {
+                    "/.".to_string()
+                } else {
+                    format!("{}/.", trimmed)
+                }
+            } else {
+                local_path_raw.to_string()
+            };
             let remote_spec = format!(
                 "{}@{}:{}",
                 server_metadata.user, server_metadata.host, remote_target
@@ -2095,6 +2401,263 @@ impl ServerPool {
             );
         }
 
+        Ok(())
+    }
+
+    pub async fn download_file_to_file(
+        &self,
+        server_metadata: &Arc<ServerMetadata>,
+        task_name: &str,
+        remote_file: &str,
+        local_file: &Path,
+        use_sudo: bool,
+        use_rsync: bool,
+        silent: bool,
+    ) -> Result<(), String> {
+        if local_file.exists() {
+            if local_file.is_dir() {
+                return Err(format!(
+                    "Local path '{}' is a directory, cannot overwrite with a file",
+                    local_file.display()
+                ));
+            }
+            crate::utils::log_utils::ask_user(
+                server_metadata,
+                task_name,
+                &format!(
+                    "Local file '{}' already exists. Overwrite it?",
+                    local_file.display()
+                ),
+                silent,
+            )
+            .await?;
+            std::fs::remove_file(local_file).map_err(|e| {
+                format!(
+                    "Failed to remove existing local file '{}': {}",
+                    local_file.display(),
+                    e
+                )
+            })?;
+        }
+        if let Some(parent) = local_file.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    format!(
+                        "Failed to create local parent directory '{}': {}",
+                        parent.display(),
+                        e
+                    )
+                })?;
+            }
+        }
+        let parent = local_file
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let name = local_file
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| {
+                format!("Invalid local file name '{}'", local_file.display())
+            })?;
+        let staging = parent.join(format!(".rhctl-dl-{}", name));
+        if staging.exists() {
+            if staging.is_dir() {
+                std::fs::remove_dir_all(&staging).map_err(|e| {
+                    format!(
+                        "Failed to remove staging path '{}': {}",
+                        staging.display(),
+                        e
+                    )
+                })?;
+            } else {
+                std::fs::remove_file(&staging).map_err(|e| {
+                    format!(
+                        "Failed to remove staging path '{}': {}",
+                        staging.display(),
+                        e
+                    )
+                })?;
+            }
+        }
+        std::fs::create_dir_all(&staging).map_err(|e| {
+            format!(
+                "Failed to create staging directory '{}': {}",
+                staging.display(),
+                e
+            )
+        })?;
+        let dl: Result<(), String> = self
+            .download_file_or_dir_contents_into_dir(
+                server_metadata,
+                task_name,
+                remote_file,
+                &staging,
+                use_sudo,
+                use_rsync,
+                true,
+                true,
+            )
+            .await;
+        if let Err(e) = dl {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(e);
+        }
+        let entries: Vec<_> = std::fs::read_dir(&staging)
+            .map_err(|e| {
+                format!(
+                    "Failed to read staging directory '{}': {}",
+                    staging.display(),
+                    e
+                )
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        if entries.len() != 1 {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(format!(
+                "Download produced an unexpected staging layout for '{}'",
+                remote_file
+            ));
+        }
+        let staged = entries[0].path();
+        if let Err(e) = Self::move_path_fallback_copy(&staged, local_file) {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(format!(
+                "Failed to move downloaded file to '{}': {}",
+                local_file.display(),
+                e
+            ));
+        }
+        let _ = std::fs::remove_dir_all(&staging);
+        log_info!(
+            server_metadata,
+            task_name,
+            "Successfully downloaded the file '{}' to '{}'",
+            remote_file,
+            local_file.display()
+        );
+        Ok(())
+    }
+
+    pub async fn download_file_into_dir(
+        &self,
+        server_metadata: &Arc<ServerMetadata>,
+        task_name: &str,
+        remote_file: &str,
+        local_dir: &Path,
+        use_sudo: bool,
+        use_rsync: bool,
+        silent: bool,
+    ) -> Result<(), String> {
+        std::fs::create_dir_all(local_dir).map_err(|e| {
+            format!(
+                "Failed to create local download directory '{}': {}",
+                local_dir.display(),
+                e
+            )
+        })?;
+        self.download_file_or_dir_contents_into_dir(
+            server_metadata,
+            task_name,
+            remote_file,
+            local_dir,
+            use_sudo,
+            use_rsync,
+            silent,
+            true,
+        )
+        .await
+    }
+
+    pub async fn download_dir_replace_dir(
+        &self,
+        server_metadata: &Arc<ServerMetadata>,
+        task_name: &str,
+        remote_dir: &str,
+        local_dir: &Path,
+        use_sudo: bool,
+        use_rsync: bool,
+        silent: bool,
+    ) -> Result<(), String> {
+        if local_dir.exists() {
+            crate::utils::log_utils::ask_user(
+                server_metadata,
+                task_name,
+                &format!(
+                    "Local directory '{}' already exists. Overwriting will DELETE it and all its contents. Continue?",
+                    local_dir.display()
+                ),
+                silent,
+            )
+            .await?;
+            if local_dir.is_dir() {
+                std::fs::remove_dir_all(local_dir).map_err(|e| {
+                    format!(
+                        "Failed to remove existing local directory '{}': {}",
+                        local_dir.display(),
+                        e
+                    )
+                })?;
+            } else {
+                std::fs::remove_file(local_dir).map_err(|e| {
+                    format!(
+                        "Failed to remove existing local file '{}': {}",
+                        local_dir.display(),
+                        e
+                    )
+                })?;
+            }
+        }
+        self.download_dir_to_new_path(
+            server_metadata,
+            task_name,
+            remote_dir,
+            local_dir,
+            use_sudo,
+            use_rsync,
+            true,
+        )
+        .await
+    }
+
+    pub async fn download_dir_to_new_path(
+        &self,
+        server_metadata: &Arc<ServerMetadata>,
+        task_name: &str,
+        remote_dir: &str,
+        local_dir: &Path,
+        use_sudo: bool,
+        use_rsync: bool,
+        silent: bool,
+    ) -> Result<(), String> {
+        std::fs::create_dir_all(local_dir).map_err(|e| {
+            format!(
+                "Failed to create local download directory '{}': {}",
+                local_dir.display(),
+                e
+            )
+        })?;
+        self.download_file_or_dir_contents_into_dir(
+            server_metadata,
+            task_name,
+            remote_dir,
+            local_dir,
+            use_sudo,
+            use_rsync,
+            true,
+            true,
+        )
+        .await?;
+        let _ = silent;
+        log_info!(
+            server_metadata,
+            task_name,
+            "Successfully downloaded the contents of the folder '{}' into '{}'",
+            remote_dir,
+            local_dir.display()
+        );
         Ok(())
     }
 

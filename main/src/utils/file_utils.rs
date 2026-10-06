@@ -117,9 +117,63 @@ pub fn parse_mapping(
     }
     Ok((source, target))
 }
-pub fn load_mapping_file(
+
+/// One parsed `source=target` (or `source=>target`) transfer mapping.
+/// `contents_only` is true only for the `=>` form: transfer the contents of
+/// a source directory into the target directory.
+#[derive(Clone, Debug)]
+pub struct TransferMapping {
+    pub source: String,
+    pub target: String,
+    pub contents_only: bool,
+}
+
+pub fn parse_transfer_mapping(
+    raw: &str,
+    vars: &HashMap<String, String>,
+    expected: &str,
+) -> Result<TransferMapping, String> {
+    let line = raw.trim();
+    // Split on the FIRST '=' so values containing '=' (e.g. env-style
+    // targets) still parse. `=>` is `=` followed by `>...`.
+    let Some(eq) = line.find('=') else {
+        return Err(format!("Invalid mapping '{}'; expected {}", raw, expected));
+    };
+    let (left, mut right) = line.split_at(eq);
+    // `right` starts with '=' here.
+    right = &right[1..];
+    let mut contents_only = false;
+    if let Some(stripped) = right.strip_prefix('>') {
+        contents_only = true;
+        right = stripped;
+    }
+    let source = substitute_vars(left.trim(), vars).map_err(|e| {
+        format!(
+            "Invalid transfer mapping '{}' (expected '{}'). \n\t> {}",
+            raw, expected, e
+        )
+    })?;
+    let target = substitute_vars(right.trim(), vars).map_err(|e| {
+        format!(
+            "Invalid transfer mapping '{}' (expected '{}'). \n\t> {}",
+            raw, expected, e
+        )
+    })?;
+    if source.is_empty() || target.is_empty() {
+        return Err(format!(
+            "Invalid transfer mapping '{}' (expected '{}').",
+            raw, expected
+        ));
+    }
+    Ok(TransferMapping {
+        source,
+        target,
+        contents_only,
+    })
+}
+pub fn load_transfer_mapping_file(
     file: &str,
-    mappings: &mut HashMap<String, String>,
+    mappings: &mut Vec<TransferMapping>,
     vars: &HashMap<String, String>,
     expected: &str,
 ) -> Result<(), String> {
@@ -131,24 +185,33 @@ pub fn load_mapping_file(
         if line.trim().is_empty() || line.starts_with('#') {
             continue;
         }
-        let (local_file_or_dir, target_path) = parse_mapping(line, vars, expected)
+        let mapping = parse_transfer_mapping(line, vars, expected)
             .map_err(|e| format!("Invalid format at line {}: {}", line_num + 1, e))?;
-        mappings.insert(local_file_or_dir, target_path);
+        upsert_transfer_mapping(mappings, mapping);
     }
     Ok(())
 }
+
+fn upsert_transfer_mapping(mappings: &mut Vec<TransferMapping>, mapping: TransferMapping) {
+    if let Some(existing) = mappings.iter_mut().find(|m| m.source == mapping.source) {
+        *existing = mapping;
+    } else {
+        mappings.push(mapping);
+    }
+}
+
 pub fn resolve_upload_mappings(
     upload_mapping: Option<&str>,
     uploads: &[String],
     vars: &HashMap<String, String>,
-) -> Result<HashMap<String, String>, String> {
-    let mut mappings = HashMap::new();
+) -> Result<Vec<TransferMapping>, String> {
+    let mut mappings: Vec<TransferMapping> = Vec::new();
     if let Some(file) = upload_mapping {
-        load_mapping_file(file, &mut mappings, vars, "local=remote-dir")?;
+        load_transfer_mapping_file(file, &mut mappings, vars, "local=remote")?;
     }
     for raw in uploads {
-        let (local, remote) = parse_mapping(raw, vars, "local=remote-dir")?;
-        mappings.insert(local, remote);
+        let mapping = parse_transfer_mapping(raw, vars, "local=remote")?;
+        upsert_transfer_mapping(&mut mappings, mapping);
     }
     Ok(mappings)
 }
@@ -157,14 +220,14 @@ pub fn resolve_download_mappings(
     download_mapping: Option<&str>,
     downloads: &[String],
     vars: &HashMap<String, String>,
-) -> Result<HashMap<String, String>, String> {
-    let mut mappings = HashMap::new();
+) -> Result<Vec<TransferMapping>, String> {
+    let mut mappings: Vec<TransferMapping> = Vec::new();
     if let Some(file) = download_mapping {
-        load_mapping_file(file, &mut mappings, vars, "remote=local-dir")?;
+        load_transfer_mapping_file(file, &mut mappings, vars, "remote=local")?;
     }
     for raw in downloads {
-        let (remote, local) = parse_mapping(raw, vars, "remote=local-dir")?;
-        mappings.insert(remote, local);
+        let mapping = parse_transfer_mapping(raw, vars, "remote=local")?;
+        upsert_transfer_mapping(&mut mappings, mapping);
     }
     Ok(mappings)
 }
@@ -320,10 +383,13 @@ pub fn expand_vars(input: &str, overlays: &HashMap<String, String>) -> Result<St
 }
 
 pub fn validate_path_chars(path: &str) -> Result<(), String> {
-    // Invalid characters check (macOS / Linux only)
+    // Invalid characters check (macOS / Linux only).
+    // NOTE: '>' is allowed here because transfer mappings use `=>` as the
+    // directory-contents separator; the separator is stripped before this
+    // validation runs on each side.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
-        let forbidden: &[char] = &['<', '>', ':', '"', '|', '?', '*'];
+        let forbidden: &[char] = &['<', ':', '"', '|', '?', '*'];
         if path.chars().any(|c| forbidden.contains(&c)) {
             return Err(format!("Path '{}' contains invalid characters.", path));
         }
@@ -352,6 +418,37 @@ pub fn expand_local_user_path(path: &str) -> String {
     path.to_string()
 }
 
+/// Local path kind used by the transfer path-mapping rules.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalPathKind {
+    File,
+    Dir,
+    Missing,
+}
+
+/// Classify a local path (after `~` expansion) as file / dir / missing.
+/// Symlinks are classified by their target (`metadata`, not `symlink_metadata`).
+pub fn local_path_kind(raw: &str) -> Result<LocalPathKind, String> {
+    let expanded = expand_local_user_path(raw);
+    let path = Path::new(&expanded);
+    if !path.exists() {
+        // `exists()` follows symlinks: broken symlink => missing.
+        return Ok(LocalPathKind::Missing);
+    }
+    let md = std::fs::metadata(path)
+        .map_err(|e| format!("Failed to stat local path '{}': {}", raw, e))?;
+    if md.is_dir() {
+        Ok(LocalPathKind::Dir)
+    } else if md.is_file() {
+        Ok(LocalPathKind::File)
+    } else {
+        Err(format!(
+            "Local path '{}' exists but is neither a file nor a directory",
+            raw
+        ))
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -360,9 +457,44 @@ mod tests {
     #[test]
     fn parse_transfer_mapping_ok() {
         let vars = HashMap::new();
-        let (l, r) = parse_mapping("a/b.txt=~/out", &vars, "local=remote-dir").unwrap();
+        let (l, r) = parse_mapping("a/b.txt=~/out", &vars, "local=remote").unwrap();
         assert_eq!(l, "a/b.txt");
         assert_eq!(r, "~/out");
+        let m = parse_transfer_mapping("a/b.txt=>~/out", &vars, "local=remote").unwrap();
+        assert_eq!(m.source, "a/b.txt");
+        assert_eq!(m.target, "~/out");
+        assert!(m.contents_only);
+        let m = parse_transfer_mapping("a/b.txt=~/out", &vars, "local=remote").unwrap();
+        assert!(!m.contents_only);
+    }
+
+    #[test]
+    fn parse_transfer_mapping_splits_on_first_eq() {
+        let vars = HashMap::new();
+        // Value containing '=' must not confuse the separator.
+        let m = parse_transfer_mapping("a=key=val", &vars, "local=remote").unwrap();
+        assert_eq!(m.source, "a");
+        assert_eq!(m.target, "key=val");
+        assert!(!m.contents_only);
+        // `=>` separator yields contents_only.
+        let m = parse_transfer_mapping("/app/dir=>/mnt/dir", &vars, "local=remote").unwrap();
+        assert_eq!(m.source, "/app/dir");
+        assert_eq!(m.target, "/mnt/dir");
+        assert!(m.contents_only);
+        // Missing separator is rejected.
+        assert!(parse_transfer_mapping("no-separator", &vars, "local=remote").is_err());
+        // Empty sides are rejected.
+        assert!(parse_transfer_mapping("=>/mnt/dir", &vars, "local=remote").is_err());
+        assert!(parse_transfer_mapping("/app/dir=>", &vars, "local=remote").is_err());
+    }
+
+    #[test]
+    fn local_path_kind_missing_for_broken_symlink_or_absent() {
+        // Absolute path that must not exist.
+        assert_eq!(
+            local_path_kind("/definitely-not-here-rhctl-12345").unwrap(),
+            LocalPathKind::Missing
+        );
     }
 
     #[test]
@@ -377,14 +509,20 @@ mod tests {
         let vars = HashMap::new();
         let uploads = vec!["local.txt=~/remote".to_string()];
         let m = resolve_upload_mappings(None, &uploads, &vars).unwrap();
-        assert_eq!(m.get("local.txt").map(String::as_str), Some("~/remote"));
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].source, "local.txt");
+        assert_eq!(m[0].target, "~/remote");
+        assert!(!m[0].contents_only);
     }
     #[test]
     fn resolve_download_inline_only() {
         let vars = HashMap::new();
-        let downloads = vec!["/remote/app=./backup".to_string()];
+        let downloads = vec!["/remote/app=>./backup".to_string()];
         let m = resolve_download_mappings(None, &downloads, &vars).unwrap();
-        assert_eq!(m.get("/remote/app").map(String::as_str), Some("./backup"));
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].source, "/remote/app");
+        assert_eq!(m[0].target, "./backup");
+        assert!(m[0].contents_only);
     }
     #[test]
     fn merge_env_keeps_remote_only_and_overwrites() {

@@ -194,8 +194,8 @@ rhctl transfer \
   [--password <pass>] \
   [--identity <key>] \
   [--certificate <cert>] \
-  [--upload <local=remote-dir> ...] \
-  [--download <remote=local-dir> ...] \
+  [--upload <local=remote | local=>remote> ...] \
+  [--download <remote=local | remote=>local> ...] \
   [--upload-mapping <file>] \
   [--download-mapping <file>] \
   [--patch-env <local=.env=remote-.env> ...] \
@@ -209,16 +209,34 @@ assets/example1.txt=~/examples
 assets/exampledir=~/examples/targetdir
 ```
 
-For `--upload`: `<local-path>=<remote-directory>`
-Maps local files or directories to target directories on the remote server.
+For `--upload`: `<local-path>=<remote-path>` or `<local-dir>=><remote-dir>`
+Maps local files or directories to remote files or directories.
 
-For `--download`: `<remote-path>=<local-directory>`
-Maps remote files or directories to target directories on the local machine.
+```text
+/app/file=/mnt/file       # file → file
+/app/file=/mnt/dir        # file → directory
+/app/dir=/mnt/dir         # directory → directory
+/app/dir=>/mnt/dir        # directory contents → directory
+```
 
-Note: The right-hand side must be a **directory**, not a file path. If it does not exist, it will be created automatically.
-Note: Files or directory contents are transferred **into** the specified target directory.
-Note: Provide at least one of `--upload`, `--download`, `--upload-mapping`, `--download-mapping`, or `--patch-env`.
-Note: `--patch-env` is only available with upload operations.
+For `--download`: `<remote-path>=<local-path>` or `<remote-dir>=><local-dir>`
+Maps remote files or directories to local files or directories (same rules, mirrored).
+
+Path rules (checked before the final transfer):
+
+* file → file: replace the target file.
+* file → dir: transfer the file into the target directory.
+* file → non-existent: create a new file at the target path.
+* dir → dir: replace the target directory.
+* dir → file: error.
+* dir → non-existent: create a new directory at the target path.
+* `=>` transfers the *contents* of a directory into the target directory
+  (e.g. `/app/dir=>/mnt/dir`); the source must be a directory and the target
+  must be a directory or non-existent (created as a directory).
+* A missing source (file or directory) is an error.
+
+Overwriting an existing target still asks for confirmation (existing logic),
+in both scp and rsync modes.
 
 **Mapping File** (`--upload-mapping` / `--download-mapping`):
 
@@ -282,8 +300,8 @@ rhctl transfer \
 * `--user <username>`: Remote username
 * At least one of:
 
-  * `--upload <local=remote-dir>`: Upload mapping (repeatable)
-  * `--download <remote=local-dir>`: Download mapping (repeatable)
+  * `--upload <local=remote | local=>remote>`: Upload mapping (repeatable)
+  * `--download <remote=local | remote=>local>`: Download mapping (repeatable)
   * `--upload-mapping <path>`: File of upload mappings
   * `--download-mapping <path>`: File of download mappings
   * `--patch-env <local=.env=remote-.env>`: Merge local `.env` into remote (upload only)

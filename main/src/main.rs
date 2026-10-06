@@ -82,21 +82,21 @@ enum Commands {
         identity: Option<String>,
         #[arg(long, help = "Path to OpenSSH certificate (requires --identity)")]
         certificate: Option<String>,
-        #[arg(long = "upload", help = "Upload mapping local=remote-dir (repeatable)")]
+        #[arg(long = "upload", help = "Upload mapping local=remote or local=>remote (contents, repeatable)")]
         upload: Vec<String>,
         #[arg(
             long = "download",
-            help = "Download mapping remote=local-dir (repeatable)"
+            help = "Download mapping remote=local or remote=>local (contents, repeatable)"
         )]
         download: Vec<String>,
         #[arg(
             long = "upload-mapping",
-            help = "Upload mapping file with local=remote-dir lines"
+            help = "Upload mapping file with local=remote or local=>remote (contents) lines"
         )]
         upload_mapping: Option<String>,
         #[arg(
             long = "download-mapping",
-            help = "Download mapping file with remote=local-dir lines"
+            help = "Download mapping file with remote=local or remote=>local (contents) lines"
         )]
         download_mapping: Option<String>,
         #[arg(

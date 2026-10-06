@@ -1,13 +1,13 @@
-use crate::common::ssh_pool::ServerPool;
+use crate::common::ssh_pool::{RemotePathKind, ServerPool};
 use crate::domain::cmd_params::{ServerMetadata, TransferCmdConfig};
 use crate::domain::constants::TRANSFER_TASK_NAME;
 use crate::utils::file_utils::{
-    expand_local_user_path, format_env_file, load_local_env_file, merge_env_entries, parse_env_file_contents,
+    expand_local_user_path, format_env_file, load_local_env_file, local_path_kind,
+    merge_env_entries, parse_env_file_contents, LocalPathKind, TransferMapping,
 };
-use crate::{log_info, log_warn};
+use crate::{log_info};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use futures::future::join_all;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 fn shell_quote(s: &str) -> String {
@@ -120,8 +120,8 @@ async fn patch_one_env(
 }
 pub async fn run(
     config: &TransferCmdConfig,
-    uploads: &HashMap<String, String>,
-    downloads: &HashMap<String, String>,
+    uploads: &[TransferMapping],
+    downloads: &[TransferMapping],
     patch_envs: &[(String, String)],
     server_metadata: &Arc<ServerMetadata>,
     global_server_pool: Arc<ServerPool>,
@@ -131,161 +131,325 @@ pub async fn run(
     }
     let mut tasks = Vec::new();
 
-    for (local_item, remote_dir) in uploads {
-        let local_file_or_dir = Path::new(local_item).to_path_buf();
-        if !local_file_or_dir.exists() {
-            log_warn!(
-                server_metadata,
-                TRANSFER_TASK_NAME,
-                "Local item '{}' not found. Skipping.",
-                local_item
-            );
-            continue;
+    for mapping in uploads {
+        let source_kind = local_path_kind(&mapping.source).map_err(|e| {
+            format!(
+                "Upload mapping failed: {} --> {} \n\t> {}",
+                mapping.source, mapping.target, e
+            )
+        })?;
+        if source_kind == LocalPathKind::Missing {
+            return Err(format!(
+                "Upload mapping failed: {} --> {} \n\t> Local source '{}' does not exist",
+                mapping.source, mapping.target, mapping.source
+            ));
         }
 
-        let remote_dir_resolved = global_server_pool
+        if mapping.contents_only && source_kind != LocalPathKind::Dir {
+            return Err(format!(
+                "Upload mapping failed: {} => {} \n\t> '=>' (contents transfer) requires a directory source",
+                mapping.source, mapping.target
+            ));
+        }
+        let local_path = expand_local_user_path(&mapping.source);
+        let remote_target_raw = global_server_pool
             .resolve_remote_path(
                 server_metadata,
                 TRANSFER_TASK_NAME,
                 config.use_sudo,
-                remote_dir,
+                &mapping.target,
             )
             .await
             .map_err(|e| {
                 format!(
-                    "Child upload task failed: {} --> {} \n\t> {}",
-                    local_item, remote_dir, e
+                    "Upload mapping failed: {} --> {} \n\t> {}",
+                    mapping.source, mapping.target, e
                 )
             })?;
-        if remote_dir_resolved.is_empty() {
+        let remote_target = if remote_target_raw != "/" {
+            remote_target_raw.trim_end_matches('/').to_string()
+        } else {
+            remote_target_raw
+        };
+        if remote_target.is_empty() {
             return Err(format!(
-                "Failed to resolve remote directory '{}'",
-                remote_dir
+                "Upload mapping failed: {} --> {} \n\t> Failed to resolve remote path '{}'",
+                mapping.source, mapping.target, mapping.target
             ));
         }
-        global_server_pool
-            .validate_remote_dir(
+        let remote_kind = global_server_pool
+            .remote_path_kind(
                 server_metadata,
                 TRANSFER_TASK_NAME,
-                &remote_dir_resolved,
+                &remote_target,
                 config.use_sudo,
             )
             .await
             .map_err(|e| {
                 format!(
-                    "Child upload task failed: {} --> {} \n\t> {}",
-                    local_item, remote_dir, e
+                    "Upload mapping failed: {} --> {} \n\t> {}",
+                    mapping.source, mapping.target, e
                 )
             })?;
+        // 0=file->file, 1=file->dir, 2=file->missing,
+        // 3=dir->dir, 4=dir->missing, 5=contents, 99=error handled above.
+        let op: u8 = match (source_kind, remote_kind, mapping.contents_only) {
+            (_, Some(RemotePathKind::File), true) => {
+                return Err(format!(
+                    "Upload mapping failed: {} => {} \n\t> Cannot transfer directory contents into a file",
+                    mapping.source, mapping.target
+                ));
+            }
+            (_, _, true) => 5,
+            (LocalPathKind::File, Some(RemotePathKind::File), false) => 0,
+            (LocalPathKind::File, Some(RemotePathKind::Dir), false) => 1,
+            (LocalPathKind::File, None, false) => {
+                if mapping.target.ends_with('/') {
+                    1
+                } else {
+                    2
+                }
+            }
+            (LocalPathKind::Dir, Some(RemotePathKind::Dir), false) => 3,
+            (LocalPathKind::Dir, Some(RemotePathKind::File), false) => {
+                return Err(format!(
+                    "Upload mapping failed: {} --> {} \n\t> Cannot transfer a directory onto a file",
+                    mapping.source, mapping.target
+                ));
+            }
+            (LocalPathKind::Dir, None, false) => 4,
+            (LocalPathKind::Missing, _, _) => {
+                return Err(format!(
+                    "Upload mapping failed: {} --> {} \n\t> Local source '{}' does not exist",
+                    mapping.source, mapping.target, mapping.source
+                ));
+            }
+        };
 
-        let local_clone = local_file_or_dir.clone();
-        let remote_clone = remote_dir_resolved.clone();
+        let local_clone = local_path.clone();
+        let remote_clone = remote_target.clone();
         let config_clone = config.clone();
         let global_server_pool_clone = global_server_pool.clone();
         let server_metadata_clone = server_metadata.clone();
+        let source_raw = mapping.source.clone();
+        let target_raw = mapping.target.clone();
         tasks.push(tokio::spawn(async move {
-            global_server_pool_clone
-                .upload_file_or_dir_contents_into_dir(
-                    &server_metadata_clone,
-                    TRANSFER_TASK_NAME,
-                    &local_clone,
-                    &remote_clone,
-                    None,
-                    config_clone.use_sudo,
-                    config_clone.use_rsync,
-                    config_clone.silent,
-                    false,
-                    true,
-                )
-                .await
-                .map_err(|e| {
-                    format!(
-                        "Child upload task failed: {} --> {} \n\t> {}",
-                        local_clone.display(),
-                        remote_clone,
-                        e
+            let res = if op == 0 || op == 2 {
+                global_server_pool_clone
+                    .upload_file_to_file(
+                        &server_metadata_clone,
+                        TRANSFER_TASK_NAME,
+                        Path::new(&local_clone),
+                        &remote_clone,
+                        config_clone.use_sudo,
+                        config_clone.use_rsync,
+                        config_clone.silent,
                     )
-                })
+                    .await
+            } else if op == 1 || op == 5 {
+                global_server_pool_clone
+                    .upload_file_or_dir_contents_into_dir(
+                        &server_metadata_clone,
+                        TRANSFER_TASK_NAME,
+                        Path::new(&local_clone),
+                        &remote_clone,
+                        None,
+                        config_clone.use_sudo,
+                        config_clone.use_rsync,
+                        config_clone.silent,
+                        false,
+                        true,
+                    )
+                    .await
+            } else if op == 3 {
+                global_server_pool_clone
+                    .upload_dir_replace_dir(
+                        &server_metadata_clone,
+                        TRANSFER_TASK_NAME,
+                        Path::new(&local_clone),
+                        &remote_clone,
+                        config_clone.use_sudo,
+                        config_clone.use_rsync,
+                        config_clone.silent,
+                    )
+                    .await
+            } else {
+                global_server_pool_clone
+                    .upload_dir_to_new_path(
+                        &server_metadata_clone,
+                        TRANSFER_TASK_NAME,
+                        Path::new(&local_clone),
+                        &remote_clone,
+                        config_clone.use_sudo,
+                        config_clone.use_rsync,
+                        config_clone.silent,
+                    )
+                    .await
+            };
+            res.map_err(|e| {
+                format!(
+                    "Child upload task failed: {} --> {} \n\t> {}",
+                    source_raw, target_raw, e
+                )
+            })
         }));
     }
 
-    for (remote_item, local_dir) in downloads {
-        let local_dir = expand_local_user_path(local_dir);
-
-        let remote_resolved = global_server_pool
+    for mapping in downloads {
+        let remote_raw = global_server_pool
             .resolve_remote_path(
                 server_metadata,
                 TRANSFER_TASK_NAME,
                 config.use_sudo,
-                remote_item,
+                &mapping.source,
             )
             .await
             .map_err(|e| {
                 format!(
-                    "Child download task failed: {} --> {} \n\t> {}",
-                    remote_item, local_dir, e
+                    "Download mapping failed: {} --> {} \n\t> {}",
+                    mapping.source, mapping.target, e
                 )
             })?;
-        let remote_resolved = if remote_resolved != "/" {
-            remote_resolved.trim_end_matches('/').to_string()
+        let remote_source = if remote_raw != "/" {
+            remote_raw.trim_end_matches('/').to_string()
         } else {
-            remote_resolved
+            remote_raw
         };
-        if remote_resolved.is_empty() {
-            return Err(format!("Failed to resolve remote path '{}'", remote_item));
-        }
-        if !global_server_pool
-            .file_or_dir_exists(
-                server_metadata,
-                TRANSFER_TASK_NAME,
-                &remote_resolved,
-                config.use_sudo,
-            )
-            .await?
-        {
-            return Err(format!("Remote path '{}' does not exist", remote_resolved));
-        }
-
-        let local_dir_path = PathBuf::from(&local_dir);
-        if local_dir_path.exists() && !local_dir_path.is_dir() {
+        if remote_source.is_empty() {
             return Err(format!(
-                "Local download target '{}' is not a directory",
-                local_dir
+                "Download mapping failed: {} --> {} \n\t> Failed to resolve remote path",
+                mapping.source, mapping.target
             ));
         }
-        std::fs::create_dir_all(&local_dir_path).map_err(|e| {
+        let remote_kind_opt = global_server_pool
+            .remote_path_kind(
+                server_metadata,
+                TRANSFER_TASK_NAME,
+                &remote_source,
+                config.use_sudo,
+            )
+            .await
+            .map_err(|e| {
+                format!(
+                    "Download mapping failed: {} --> {} \n\t> {}",
+                    mapping.source, mapping.target, e
+                )
+            })?;
+        let Some(remote_kind) = remote_kind_opt else {
+            return Err(format!(
+                "Download mapping failed: {} --> {} \n\t> Remote source '{}' does not exist",
+                mapping.source, mapping.target, mapping.source
+            ));
+        };
+        if mapping.contents_only && remote_kind != RemotePathKind::Dir {
+            return Err(format!(
+                "Download mapping failed: {} => {} \n\t> '=>' requires a directory source",
+                mapping.source, mapping.target
+            ));
+        }
+        let local_kind = local_path_kind(&mapping.target).map_err(|e| {
             format!(
-                "Failed to create local download directory '{}': {}",
-                local_dir, e
+                "Download mapping failed: {} --> {} \n\t> {}",
+                mapping.source, mapping.target, e
             )
         })?;
+        let local_target = expand_local_user_path(&mapping.target);
+        let dop: u8 = match (remote_kind, local_kind, mapping.contents_only) {
+            (_, _, true) if remote_kind == RemotePathKind::File => {
+                return Err(format!(
+                    "Download mapping failed: {} => {} \n\t> Cannot transfer contents from a file",
+                    mapping.source, mapping.target
+                ));
+            }
+            (_, LocalPathKind::File, true) => {
+                return Err(format!(
+                    "Download mapping failed: {} => {} \n\t> Cannot transfer contents into a file",
+                    mapping.source, mapping.target
+                ));
+            }
+            (_, _, true) => 5,
+            (RemotePathKind::File, LocalPathKind::File, false) => 0,
+            (RemotePathKind::File, LocalPathKind::Dir, false) => 1,
+            (RemotePathKind::File, LocalPathKind::Missing, false) => {
+                if mapping.target.ends_with('/') || mapping.target.ends_with('\\') {
+                    1
+                } else {
+                    2
+                }
+            }
+            (RemotePathKind::Dir, LocalPathKind::Dir, false) => 3,
+            (RemotePathKind::Dir, LocalPathKind::File, false) => {
+                return Err(format!(
+                    "Download mapping failed: {} --> {} \n\t> Cannot transfer a directory onto a file",
+                    mapping.source, mapping.target
+                ));
+            }
+            (RemotePathKind::Dir, LocalPathKind::Missing, false) => 4,
+        };
 
-        let remote_clone = remote_resolved.clone();
-        let local_clone = local_dir_path.clone();
+        let remote_clone = remote_source.clone();
+        let local_clone = local_target.clone();
         let config_clone = config.clone();
         let global_server_pool_clone = global_server_pool.clone();
         let server_metadata_clone = server_metadata.clone();
+        let source_raw = mapping.source.clone();
+        let target_raw = mapping.target.clone();
         tasks.push(tokio::spawn(async move {
-            global_server_pool_clone
-                .download_file_or_dir_contents_into_dir(
-                    &server_metadata_clone,
-                    TRANSFER_TASK_NAME,
-                    &remote_clone,
-                    &local_clone,
-                    config_clone.use_sudo,
-                    config_clone.use_rsync,
-                    config_clone.silent,
-                    true,
-                )
-                .await
-                .map_err(|e| {
-                    format!(
-                        "Child download task failed: {} --> {} \n\t> {}",
-                        remote_clone,
-                        local_clone.display(),
-                        e
+            let res = if dop == 0 || dop == 2 {
+                global_server_pool_clone
+                    .download_file_to_file(
+                        &server_metadata_clone,
+                        TRANSFER_TASK_NAME,
+                        &remote_clone,
+                        Path::new(&local_clone),
+                        config_clone.use_sudo,
+                        config_clone.use_rsync,
+                        config_clone.silent,
                     )
-                })
+                    .await
+            } else if dop == 1 || dop == 5 {
+                global_server_pool_clone
+                    .download_file_into_dir(
+                        &server_metadata_clone,
+                        TRANSFER_TASK_NAME,
+                        &remote_clone,
+                        Path::new(&local_clone),
+                        config_clone.use_sudo,
+                        config_clone.use_rsync,
+                        config_clone.silent,
+                    )
+                    .await
+            } else if dop == 3 {
+                global_server_pool_clone
+                    .download_dir_replace_dir(
+                        &server_metadata_clone,
+                        TRANSFER_TASK_NAME,
+                        &remote_clone,
+                        Path::new(&local_clone),
+                        config_clone.use_sudo,
+                        config_clone.use_rsync,
+                        config_clone.silent,
+                    )
+                    .await
+            } else {
+                global_server_pool_clone
+                    .download_dir_to_new_path(
+                        &server_metadata_clone,
+                        TRANSFER_TASK_NAME,
+                        &remote_clone,
+                        Path::new(&local_clone),
+                        config_clone.use_sudo,
+                        config_clone.use_rsync,
+                        config_clone.silent,
+                    )
+                    .await
+            };
+            res.map_err(|e| {
+                format!(
+                    "Child download task failed: {} --> {} \n\t> {}",
+                    source_raw, target_raw, e
+                )
+            })
         }));
     }
 
