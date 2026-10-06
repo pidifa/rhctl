@@ -525,24 +525,16 @@ fn build_transfer_step_configs(
     for server in servers {
         let has_upload = transfer.upload_mapping.is_some() || !transfer.uploads.is_empty();
         let has_download = transfer.download_mapping.is_some() || !transfer.downloads.is_empty();
-        if !has_upload && !has_download {
+        if !has_upload && !has_download && transfer.patch_envs.is_empty() {
             log_error_with_host_direct!(
                 &server.user,
                 &server.host,
                 TRANSFER_TASK_NAME,
-                "Transfer step requires upload and/or download mappings"
+                "Transfer step requires upload or download or patch-envs mappings"
             );
             exit(1);
         }
-        if !transfer.patch_envs.is_empty() && !has_upload {
-            log_error_with_host_direct!(
-                &server.user,
-                &server.host,
-                TRANSFER_TASK_NAME,
-                "--patch-env can only be used with upload mappings"
-            );
-            exit(1);
-        }
+
         let upload_mapping = transfer.upload_mapping.as_ref().map(|f| {
             substitute_vars(f, var_map).unwrap_or_else(|e| {
                 log_error_with_host_direct!(
