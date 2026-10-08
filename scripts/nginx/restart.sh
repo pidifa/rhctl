@@ -1,4 +1,3 @@
-```bash
 #!/bin/bash
 
 # ****************************************************************************************************
@@ -49,4 +48,3 @@ echo
 echo "Nginx restart completed."
 echo "Version: $(nginx -v 2>&1)"
 echo "Service: $(systemctl is-active nginx 2>/dev/null || echo "unknown")"
-```
