@@ -16,7 +16,10 @@
 #   ./systemd.sh enable-all
 #   ./systemd.sh status-all
 #   ./systemd.sh restart-all
+#   ./systemd.sh disable-all
+#   ./systemd.sh stop-all
 #   ./systemd.sh start --service rhctl-test-gateway-1.0.0
+#   ./systemd.sh enable --service rhctl-test-gateway-1.0.0
 #   ./systemd.sh stop --service rhctl-test-gateway-1.0.0
 #   ./systemd.sh restart --service rhctl-test-gateway-1.0.0
 #   ./systemd.sh remove --service rhctl-test-gateway-1.0.0
@@ -38,6 +41,15 @@
 #   restart-all
 #       Restart all rhctl-created systemd services.
 #
+#   disable-all
+#       Disable all rhctl-created systemd services so they do not start
+#       automatically at boot. Running services are not stopped. Service files
+#       are not removed.
+#
+#   stop-all
+#       Stop all rhctl-created systemd services. Services are not disabled and
+#       service files are not removed.
+#
 #   start
 #       Start an rhctl-created systemd service.
 #
@@ -46,6 +58,9 @@
 #
 #   restart
 #       Restart an rhctl-created systemd service.
+#
+#   enable
+#       Enable an rhctl-created systemd service to start automatically at boot.
 #
 #   remove
 #       Stop, disable, and permanently remove an rhctl-created service.
@@ -70,6 +85,16 @@
 #
 # Parameters (restart-all):
 #   (none)
+#
+# Parameters (disable-all):
+#   (none)
+#
+# Parameters (stop-all):
+#   (none)
+#
+# Parameters (enable):
+#   --service <name>
+#       Service name to enable (required).
 #
 # Parameters (start):
 #   --service <name>
@@ -135,7 +160,10 @@ Usage:
   ${SCRIPT_NAME} enable-all
   ${SCRIPT_NAME} status-all
   ${SCRIPT_NAME} restart-all
+  ${SCRIPT_NAME} disable-all
+  ${SCRIPT_NAME} stop-all
   ${SCRIPT_NAME} start --service <name>
+  ${SCRIPT_NAME} enable --service <name>
   ${SCRIPT_NAME} stop --service <name>
   ${SCRIPT_NAME} restart --service <name>
   ${SCRIPT_NAME} remove --service <name>
@@ -157,6 +185,15 @@ Subcommands:
   restart-all
       Restart all rhctl-created systemd services.
 
+  disable-all
+      Disable all rhctl-created systemd services so they do not start
+      automatically at boot. Running services are not stopped. Service files
+      are not removed.
+
+  stop-all
+      Stop all rhctl-created systemd services. Services are not disabled and
+      service files are not removed.
+
   start
       Start an rhctl-created systemd service.
 
@@ -165,6 +202,9 @@ Subcommands:
 
   restart
       Restart an rhctl-created systemd service.
+
+  enable
+      Enable an rhctl-created systemd service to start automatically at boot.
 
   remove
       Stop, disable, and permanently remove an rhctl-created service.
@@ -186,6 +226,16 @@ Parameters (status-all):
 
 Parameters (restart-all):
   (none)
+
+Parameters (disable-all):
+  (none)
+
+Parameters (stop-all):
+  (none)
+
+Parameters (enable):
+  --service <name>
+      Service name to enable (required).
 
 Parameters (start):
   --service <name>
@@ -291,6 +341,21 @@ enable_services() {
 }
 
 
+# ========================================================================= Service enable
+
+enable_service() {
+    local service
+    service="$(normalize_service_name "$1")"
+
+    validate_service_name "${service}"
+
+    echo "Enabling ${service}..."
+    systemctl enable "${service}"
+
+    echo "Enabled ${service}."
+}
+
+
 # ========================================================================= Service status
 
 status_all_services() {
@@ -355,6 +420,66 @@ restart_all_services() {
         echo "Restarting ${service}..."
         systemctl restart "${service}"
     done <<< "${services}"
+}
+
+
+# ========================================================================= Service stop all
+
+stop_all_services() {
+    local services
+    local service
+
+    services="$(list_services)"
+
+    if [[ -z "${services}" ]]; then
+        echo "No rhctl services found."
+        return 0
+    fi
+
+    while IFS= read -r service; do
+        [[ -n "${service}" ]] || continue
+
+        if systemctl is-active --quiet "${service}"; then
+            echo "Stopping ${service}..."
+            systemctl stop "${service}"
+        fi
+
+        systemctl reset-failed "${service}" 2>/dev/null || true
+
+        echo "Stopped ${service}."
+    done <<< "${services}"
+
+    systemctl daemon-reload
+}
+
+
+# ========================================================================= Service disable all
+
+disable_all_services() {
+    local services
+    local service
+
+    services="$(list_services)"
+
+    if [[ -z "${services}" ]]; then
+        echo "No rhctl services found."
+        return 0
+    fi
+
+    while IFS= read -r service; do
+        [[ -n "${service}" ]] || continue
+
+        if systemctl is-enabled --quiet "${service}" 2>/dev/null; then
+            echo "Disabling ${service}..."
+            systemctl disable "${service}"
+        fi
+
+        systemctl reset-failed "${service}" 2>/dev/null || true
+
+        echo "Disabled ${service}."
+    done <<< "${services}"
+
+    systemctl daemon-reload
 }
 
 
@@ -635,10 +760,36 @@ main() {
             restart_all_services
             ;;
 
+        disable-all)
+            if [[ $# -ne 0 ]]; then
+                echo "Error: disable-all does not accept parameters." >&2
+                usage
+                exit 1
+            fi
+
+            disable_all_services
+            ;;
+
+        stop-all)
+            if [[ $# -ne 0 ]]; then
+                echo "Error: stop-all does not accept parameters." >&2
+                usage
+                exit 1
+            fi
+
+            stop_all_services
+            ;;
+
         start|stop|restart)
             local service
             service="$(parse_service_parameter "$@")"
             service_operation "${command}" "${service}"
+            ;;
+
+        enable)
+            local service
+            service="$(parse_service_parameter "$@")"
+            enable_service "${service}"
             ;;
 
         remove)
