@@ -2248,10 +2248,19 @@ impl ServerPool {
             .map_err(|e| format!("Invalid remote target '{}': {}", remote_target, e))?;     
 
         let scp_cmd = if use_sudo && server_metadata.user != "root" {
-            format!("sudo -n scp -t {}", quoted_target)
+            format!("sudo -S scp -t {}", quoted_target)
         } else {
             format!("scp -t {}", quoted_target)
-        };      
+        };
+
+        log_debug!(
+            server_metadata,
+            task_name,
+            "SCP upload command: {} (file: {})",
+            scp_cmd,
+            local_file_or_dir.display()
+        );
+
 
         let mut channel_guard = self.get_channel(server_metadata).await?;
 
@@ -2261,8 +2270,25 @@ impl ServerPool {
                 .await
                 .map_err(|e| e.to_string())?;
 
-            // Wait for ACK
-            self.wait_for_ack(&mut channel_guard.channel).await?;
+            // If using sudo -S, feed the password to sudo before the SCP protocol starts.
+            // sudo reads the password from stdin, then execs scp -t with the remaining stdin.
+            if use_sudo && server_metadata.user != "root" {
+                let password_with_newline = format!("{}
+", server_metadata.password);
+                channel_guard
+                    .channel
+                    .data(password_with_newline.as_bytes())
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+
+            // Wait for initial ACK (SCP handshake)
+            self.wait_for_ack(
+                &mut channel_guard.channel,
+                "initial SCP handshake",
+                local_file_or_dir,
+            )
+            .await?;
 
             // Send header
             let filename = local_file_or_dir.file_name().unwrap().to_str().unwrap();
@@ -2273,7 +2299,12 @@ impl ServerPool {
                 .data(header.as_bytes())
                 .await
                 .map_err(|e| e.to_string())?;
-            self.wait_for_ack(&mut channel_guard.channel).await?;
+            self.wait_for_ack(
+                &mut channel_guard.channel,
+                "SCP header",
+                local_file_or_dir,
+            )
+            .await?;
 
             // Send file data
             let mut reader =
@@ -2301,7 +2332,12 @@ impl ServerPool {
                 .map_err(|e| e.to_string())?;
 
             // Wait for ACK after finishing file transfer
-            self.wait_for_ack(&mut channel_guard.channel).await?;
+            self.wait_for_ack(
+                &mut channel_guard.channel,
+                "SCP file transfer complete",
+                local_file_or_dir,
+            )
+            .await?;
 
             channel_guard
                 .channel
@@ -2313,7 +2349,12 @@ impl ServerPool {
         Ok(())
     }
 
-    async fn wait_for_ack(&self, channel: &mut russh::Channel<Msg>) -> Result<(), String> {
+    async fn wait_for_ack(
+        &self,
+        channel: &mut russh::Channel<Msg>,
+        stage: &str,
+        local_path: &Path,
+    ) -> Result<(), String> {
         let mut ack_buf = Vec::new();
         let mut stderr_buf = Vec::new();
         while let Some(msg) = channel.wait().await {
@@ -2324,9 +2365,10 @@ impl ServerPool {
                         return Ok(());
                     } else if ack_buf.contains(&1) || ack_buf.contains(&2) {
                         return Err(format!(
-                            "SCP remote error: {}{}",
+                            "SCP remote error during '{}' for file '{}': {}",
+                            stage,
+                            local_path.display(),
                             String::from_utf8_lossy(&ack_buf),
-                            Self::stderr_tail(&stderr_buf)
                         ));
                     }
                 }
@@ -2341,17 +2383,21 @@ impl ServerPool {
             }
         }
         let stderr_tail = Self::stderr_tail(&stderr_buf);
-        Err(format!("SCP: No ACK from server{}", stderr_tail))
+        Err(format!(
+            "SCP: No ACK from server during '{}' for file '{}'{}",
+            stage,
+            local_path.display(),
+            stderr_tail
+        ))
     }
-
     fn stderr_tail(buf: &[u8]) -> String {
         let text = String::from_utf8_lossy(buf);
         let text = text.trim();
         if text.is_empty() {
             String::new()
         } else {
-            // Keep only the last few lines to avoid flooding the error message.
-            let lines: Vec<&str> = text.lines().rev().take(5).collect();
+            // Keep the last N lines to provide context without flooding the error message.
+            let lines: Vec<&str> = text.lines().rev().take(20).collect();
             let tail: String = lines.into_iter().rev().collect::<Vec<&str>>().join("\n");
             format!("\nRemote SCP stderr:\n{}", tail)
         }

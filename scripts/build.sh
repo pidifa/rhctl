@@ -36,11 +36,13 @@ BIN_PATH="${RELEASE_DIR}/${BIN_NAME}"
 INSTALL_PATH="${INSTALL_DIR}/${BIN_NAME}"
 
 # ========================================================================= Validate
+echo "Building rhctl in release mode..."
+cd "${PROJECT_ROOT}/main"
+cargo build --release
+
 if [[ ! -f "${BIN_PATH}" ]]; then
-  echo "Release binary not found at ${BIN_PATH}" >&2
-  echo "Building rhctl in release mode..." >&2
-  cd "${PROJECT_ROOT}/main"
-  cargo build --release
+  echo "Release binary not found at ${BIN_PATH} after build" >&2
+  exit 1
 fi
 
 if [[ ! -x "${BIN_PATH}" ]]; then
