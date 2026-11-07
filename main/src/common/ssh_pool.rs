@@ -1134,7 +1134,15 @@ impl ServerPool {
 
                         let mut msg;
 
-                        if stderr_str.contains(SUDO_ERR_MSG) {
+                        // When no password is available (identity / key-based auth) and
+                        // sudo requires one, report the real cause instead of the
+                        // misleading use_sudo is not enabled message.
+                        if !sudo_interactive && stderr_str.contains(SUDO_ERR_MSG) {
+                            msg = format!(
+                                "sudo requires a password, but no password was provided (identity / key-based auth). \n\t> Enable passwordless sudo for the remote user or supply --password. \n\t> Command line: \n{}",
+                                cmd
+                            );
+                        } else if stderr_str.contains(SUDO_ERR_MSG) {
                             msg = format!(
                             "Detected 'sudo' at the start of a command line, but 'use_sudo' is not enabled. Enable 'use_sudo' to run commands with sudo. \n\t> Command line: \n{}",
                             cmd
