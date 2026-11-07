@@ -1,25 +1,3 @@
-=================================================== Release Branch
-release/1.0.6
-
-=================================================== Release Tag
-Format:
-    v[version]
-Example:
-    v1.0.6
-
-=================================================== Release Title
-Format:
-    v[version]
-Example:
-    v1.0.6
-
-=================================================== Release Description Format
-Write the GitHub Release description manually (CI attaches artifacts and
-updates the Homebrew tap; it does not generate or overwrite release notes).
-
-Requires repository secret GIT_TOKEN with Contents write access to
-saidake/homebrew-rhctl.
-
 # What's New
 
 ## 🧪 Test Suite Fixes (`scripts/test.sh`)
