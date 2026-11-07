@@ -1,8 +1,6 @@
 # What's New
 
-## 📦 Repository Migration
-
-- A password is required when using sudo if the server does not allow passwordless sudo.
+- Check whether a password is required when using sudo if the server does not allow passwordless sudo.
 
 ### Installation 🧰
 #### Homebrew (macOS / Linux)
