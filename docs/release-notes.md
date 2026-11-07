@@ -2,7 +2,7 @@
 
 ## 📦 Repository Migration
 
-- Transferred repository to pidifa: The rhctl repository has been transferred to the pidifa organization.
+- A password is required when using sudo if the server does not allow passwordless sudo.
 
 ### Installation 🧰
 #### Homebrew (macOS / Linux)
