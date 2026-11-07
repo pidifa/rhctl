@@ -4,9 +4,9 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 # ************************************************************************************
-# Upgrade the rhctl version in main/Cargo.toml.
+# Upgrade the rhctl version in main/Cargo.toml and docs/release-notes.md.
 #
-# Sets the `version` field to the specified semantic version.
+# Sets the `version` field to the specified semantic version in both files.
 #
 # If exists, overwrite — safe to re-run.
 #
@@ -37,6 +37,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 MAIN_DIR="$ROOT_DIR/main"
 CARGO_TOML="$MAIN_DIR/Cargo.toml"
+RELEASE_NOTES="$ROOT_DIR/docs/release-notes.md"
 
 NEW_VERSION=""
 
@@ -45,8 +46,8 @@ usage() {
   cat <<'EOF'
 Usage: bash scripts/upgrade.sh <version>
 
-Sets the `version` field in main/Cargo.toml to the specified semantic version
-and commits the change to the main branch.
+Sets the `version` field in main/Cargo.toml and docs/release-notes.md to the specified semantic version
+and commits the changes to the main branch.
 
 Arguments:
   <version>   The new semantic version to set (e.g. `1.0.6`).
@@ -113,6 +114,11 @@ if [ ! -f "$CARGO_TOML" ]; then
   exit 1
 fi
 
+if [ ! -f "$RELEASE_NOTES" ]; then
+  echo "error: $RELEASE_NOTES not found" >&2
+  exit 1
+fi
+
 cd "$ROOT_DIR"
 
 # ========================================================================= Ensure main branch
@@ -133,11 +139,16 @@ fi
 # ========================================================================= Update version
 sed -i -E "s/^(version = )\"[^\"]+\"/\1\"$NEW_VERSION\"/" "$CARGO_TOML"
 
+# ========================================================================= Update release notes version
+CURRENT_VERSION_ESCAPED="${CURRENT_VERSION//./\\.}"
+sed -i -E "s/v${CURRENT_VERSION_ESCAPED}/v${NEW_VERSION}/g; s/${CURRENT_VERSION_ESCAPED}/${NEW_VERSION}/g" "$RELEASE_NOTES"
+
 # ========================================================================= Commit
-git add main/Cargo.toml
+git add main/Cargo.toml docs/release-notes.md
 git commit -m "chore: upgrade version to $NEW_VERSION"
 git push origin main
 
 # ========================================================================= Final output
 echo "Upgraded main/Cargo.toml version: $CURRENT_VERSION -> $NEW_VERSION"
+echo "Updated docs/release-notes.md version: $CURRENT_VERSION -> $NEW_VERSION"
 echo "Committed and pushed to main branch."
