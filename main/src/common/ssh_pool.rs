@@ -1219,7 +1219,7 @@ impl ServerPool {
                 .await?;
 
                 return self
-                    .upload_dir_via_tar_scp(
+                    .upload_dir_via_tar_stream(
                         server_metadata,
                         task_name,
                         local_file_or_dir,
@@ -1320,7 +1320,11 @@ impl ServerPool {
     /// locally, transfer it as one SCP file, and extract it remotely. This
     /// reduces N round-trips to ~1 and is especially beneficial for directories
     /// containing many small files.
-    async fn upload_dir_via_tar_scp(
+    /// Upload a local directory to a remote directory by streaming a tar archive
+    /// directly over the SSH channel. No temporary tar file is created locally
+    /// or remotely — the tar stream is piped directly into a remote `tar -xf -`
+    /// command.
+    async fn upload_dir_via_tar_stream(
         &self,
         server_metadata: &Arc<ServerMetadata>,
         task_name: &str,
@@ -1328,12 +1332,45 @@ impl ServerPool {
         remote_dir: &str,
         use_sudo: bool,
     ) -> Result<(), String> {
-        // Create a tar archive of the directory in the system temp folder.
-        let tar_temp = std::env::temp_dir().join(format!(
-            "rhctl-upload-{}.tar",
-            std::process::id()
-        ));
+        // Ensure the remote target directory exists.
+        self.create_remote_dir_if_not_exists(server_metadata, task_name, remote_dir, use_sudo)
+            .await?;
 
+        // Build the remote extraction command that reads tar from stdin.
+        let extract_cmd = if use_sudo && server_metadata.user != "root" {
+            format!("sudo -S tar -xf - --strip-components=1 -C {}", remote_dir)
+        } else {
+            format!("tar -xf - --strip-components=1 -C {}", remote_dir)
+        };
+
+        log_debug!(
+            server_metadata,
+            task_name,
+            "Streaming tar upload to remote: {}",
+            extract_cmd
+        );
+
+        // Get an SSH channel and exec the remote extraction command.
+        let mut channel_guard = self.get_channel(server_metadata).await?;
+
+        channel_guard
+            .channel
+            .exec(true, extract_cmd.as_bytes().to_vec())
+            .await
+            .map_err(|e| format!("Failed to exec remote tar extraction: {}", e))?;
+
+        // If using sudo -S, feed the password before the tar stream.
+        if use_sudo && server_metadata.user != "root" {
+            let password_with_newline = format!("{}
+", server_metadata.password);
+            channel_guard
+                .channel
+                .data(password_with_newline.as_bytes())
+                .await
+                .map_err(|e| format!("Failed to send sudo password: {}", e))?;
+        }
+
+        // Spawn a local tar process that writes the archive to stdout.
         let dir_parent = local_dir.parent().unwrap_or(local_dir);
         let dir_name = local_dir
             .file_name()
@@ -1341,71 +1378,78 @@ impl ServerPool {
             .to_string_lossy()
             .to_string();
 
-        let tar_status = std::process::Command::new("tar")
+        let mut tar_child = std::process::Command::new("tar")
             .arg("-cf")
-            .arg(&tar_temp)
+            .arg("-")
             .arg("-C")
             .arg(dir_parent)
             .arg(&dir_name)
-            .status()
-            .map_err(|e| format!("Failed to create tar archive: {}", e))?;
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("Failed to spawn tar process: {}", e))?;
 
-        if !tar_status.success() {
-            return Err("Failed to create tar archive".to_string());
+        let tar_stdout = tar_child
+            .stdout
+            .take()
+            .ok_or("Failed to capture tar stdout")?;
+
+        // Stream tar output through the SSH channel in 64KiB chunks.
+        use std::io::Read;
+        let mut buf = [0u8; 65536];
+        let mut reader = std::io::BufReader::new(tar_stdout);
+        loop {
+            let n = reader.read(&mut buf).map_err(|e| format!("Failed to read tar stream: {}", e))?;
+            if n == 0 {
+                break;
+            }
+            channel_guard
+                .channel
+                .data(&mut std::io::Cursor::new(&buf[..n]))
+                .await
+                .map_err(|e| format!("Failed to send tar stream chunk: {}", e))?;
         }
 
-        // Ensure the remote target directory exists.
-        self.create_remote_dir_if_not_exists(server_metadata, task_name, remote_dir, use_sudo)
-            .await?;
+        // Send end-of-stream marker (null byte) and close the channel.
+        let mut cursor = std::io::Cursor::new(&[0u8]);
+        channel_guard
+            .channel
+            .data(&mut cursor)
+            .await
+            .map_err(|e| format!("Failed to send tar stream terminator: {}", e))?;
 
-        // Upload the tar file as a single SCP file into the remote directory.
-        self.do_upload(
+        channel_guard
+            .channel
+            .close()
+            .await
+            .map_err(|e| format!("Failed to close channel: {}", e))?;
+
+        // Wait for the tar child process to finish.
+        let tar_status = tar_child
+            .wait()
+            .map_err(|e| format!("Failed to wait for tar process: {}", e))?;
+        if !tar_status.success() {
+            let stderr_bytes = tar_child
+                .stderr
+                .as_mut()
+                .map(|s| {
+                    let mut b = Vec::new();
+                    s.read_to_end(&mut b).ok();
+                    b
+                })
+                .unwrap_or_default();
+            let stderr = String::from_utf8_lossy(&stderr_bytes);
+            return Err(format!(
+                "Local tar process failed with status {:?}: {}",
+                tar_status.code(),
+                stderr
+            ));
+        }
+
+        log_debug!(
             server_metadata,
             task_name,
-            use_sudo,
-            false, // force SCP (not rsync) for the tar file
-            Path::new(&tar_temp),
-            remote_dir,
-            Some(".rhctl-upload.tar"),
-        )
-        .await?;
-
-        // Extract the archive into the remote directory, stripping the top-level
-        // directory name so contents land directly in `remote_dir`.
-        let extract_cmd = if use_sudo && server_metadata.user != "root" {
-            format!(
-                "sudo -n tar -xf {} --strip-components=1 -C {}",
-                remote_dir.trim_end_matches('/'),
-                remote_dir
-            )
-        } else {
-            format!(
-                "tar -xf {} --strip-components=1 -C {}",
-                remote_dir.trim_end_matches('/'),
-                remote_dir
-            )
-        };
-
-        self.exec(server_metadata, task_name, &extract_cmd, use_sudo)
-            .await?;
-
-        // Clean up the remote tar file.
-        let cleanup_cmd = format!(
-            "rm -f {}/.rhctl-upload.tar",
-            remote_dir.trim_end_matches('/')
-        );
-        let _ = self
-            .exec(server_metadata, task_name, &cleanup_cmd, use_sudo)
-            .await;
-
-        // Clean up the local tar file.
-        let _ = std::fs::remove_file(&tar_temp);
-
-        log_info!(
-            server_metadata,
-            task_name,
-            "Successfully uploaded the contents of the folder '{}' into '{}' via tar",
-            local_dir.display(),
+            "Tar stream upload to '{}' completed",
             remote_dir
         );
 

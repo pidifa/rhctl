@@ -22,7 +22,7 @@ configs:
     # General command options (applied to all operations in this config)
     use-sudo: false
     use-rsync: false
-    silent: false
+    silent: true
 
     target-servers: ["test-server1","test-server2"] 
     # target-groups: ["dev"]

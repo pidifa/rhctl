@@ -91,6 +91,7 @@ cat <<EOF
     --script "${ASSETS_ROOT}/example-bash2.sh" \\
     --mode async \\
     --use-sudo \\
+    --silent \\
     --debug
 EOF
   "${RHCTL_BIN}" execute \
@@ -102,6 +103,7 @@ EOF
     --script "${ASSETS_ROOT}/example-bash2.sh" \
     --mode async \
     --use-sudo \
+    --silent \
     --debug
   if [[ $? -eq 0 ]]; then
     log_pass "execute with scripts (async, --use-sudo)"
@@ -118,6 +120,7 @@ cat <<EOF
     --ssh-port "${RHCTL_SSH_PORT}" \\
     --password "${RHCTL_PASSWORD}" \\
     --cmd "hostname" \\
+    --silent \\
     --debug
 EOF
   "${RHCTL_BIN}" execute \
@@ -126,6 +129,7 @@ EOF
     --ssh-port "${RHCTL_SSH_PORT}" \
     --password "${RHCTL_PASSWORD}" \
     --cmd "hostname" \
+    --silent \
     --debug
   if [[ $? -eq 0 ]]; then
     log_pass "execute with remote command"
@@ -143,6 +147,7 @@ cat <<EOF
     --password "${RHCTL_PASSWORD}" \\
     --script "${ASSETS_ROOT}/example-bash1.sh" \\
     --mode sync \\
+    --silent \\
     --debug
 EOF
   "${RHCTL_BIN}" execute \
@@ -152,6 +157,7 @@ EOF
     --password "${RHCTL_PASSWORD}" \
     --script "${ASSETS_ROOT}/example-bash1.sh" \
     --mode sync \
+    --silent \
     --debug
   if [[ $? -eq 0 ]]; then
     log_pass "execute with script parameters (sync)"
@@ -172,8 +178,9 @@ cat <<EOF
     --user "${RHCTL_USER}" \\
     --ssh-port "${RHCTL_SSH_PORT}" \\
     --password "${RHCTL_PASSWORD}" \\
-    --upload "${ASSETS_ROOT}/example1.txt=~/examples" \\
+    --upload "${ASSETS_ROOT}/example.env=~/examples" \\
     --upload "${ASSETS_ROOT}/exampledir=~/examples/targetdir" \\
+    --silent \\
     --debug
 EOF
   "${RHCTL_BIN}" transfer \
@@ -181,8 +188,9 @@ EOF
     --user "${RHCTL_USER}" \
     --ssh-port "${RHCTL_SSH_PORT}" \
     --password "${RHCTL_PASSWORD}" \
-    --upload "${ASSETS_ROOT}/example1.txt=~/examples" \
+    --upload "${ASSETS_ROOT}/example.env=~/examples" \
     --upload "${ASSETS_ROOT}/exampledir=~/examples/targetdir" \
+    --silent \
     --debug
   if [[ $? -eq 0 ]]; then
     log_pass "transfer upload (file + directory)"
@@ -198,7 +206,8 @@ cat <<EOF
     --user "${RHCTL_USER}" \\
     --ssh-port "${RHCTL_SSH_PORT}" \\
     --password "${RHCTL_PASSWORD}" \\
-    --download "~/examples/example1.txt=/tmp/rhctl-test-downloads" \\
+    --download "~/examples/example.env=/tmp/rhctl-test-downloads" \\
+    --silent \\
     --debug
 EOF
   "${RHCTL_BIN}" transfer \
@@ -206,7 +215,8 @@ EOF
     --user "${RHCTL_USER}" \
     --ssh-port "${RHCTL_SSH_PORT}" \
     --password "${RHCTL_PASSWORD}" \
-    --download "~/examples/example1.txt=/tmp/rhctl-test-downloads" \
+    --download "~/examples/example.env=/tmp/rhctl-test-downloads" \
+    --silent \
     --debug
   if [[ $? -eq 0 ]]; then
     log_pass "transfer download"
@@ -223,6 +233,7 @@ cat <<EOF
     --ssh-port "${RHCTL_SSH_PORT}" \\
     --password "${RHCTL_PASSWORD}" \\
     --upload-mapping "${PROJECT_ROOT}/config/path-mapping.properties" \\
+    --silent \\
     --debug
 EOF
   "${RHCTL_BIN}" transfer \
@@ -231,6 +242,7 @@ EOF
     --ssh-port "${RHCTL_SSH_PORT}" \
     --password "${RHCTL_PASSWORD}" \
     --upload-mapping "${PROJECT_ROOT}/config/path-mapping.properties" \
+    --silent \
     --debug
   if [[ $? -eq 0 ]]; then
     log_pass "transfer upload mapping file"
@@ -246,7 +258,8 @@ cat <<EOF
     --user "${RHCTL_USER}" \\
     --ssh-port "${RHCTL_SSH_PORT}" \\
     --password "${RHCTL_PASSWORD}" \\
-    --patch-env "${ASSETS_ROOT}/example1.txt=/tmp/rhctl-test-env" \\
+    --patch-env "${ASSETS_ROOT}/example.env=/tmp/rhctl-test-env" \\
+    --silent \\
     --debug
 EOF
   "${RHCTL_BIN}" transfer \
@@ -254,7 +267,8 @@ EOF
     --user "${RHCTL_USER}" \
     --ssh-port "${RHCTL_SSH_PORT}" \
     --password "${RHCTL_PASSWORD}" \
-    --patch-env "${ASSETS_ROOT}/example1.txt=/tmp/rhctl-test-env" \
+    --patch-env "${ASSETS_ROOT}/example.env=/tmp/rhctl-test-env" \
+    --silent \
     --debug
   if [[ $? -eq 0 ]]; then
     log_pass "transfer patch-env"
@@ -270,8 +284,9 @@ cat <<EOF
     --user "${RHCTL_USER}" \\
     --ssh-port "${RHCTL_SSH_PORT}" \\
     --password "${RHCTL_PASSWORD}" \\
-    --upload "${ASSETS_ROOT}/example1.txt=~/examples/rsync-test" \\
+    --upload "${ASSETS_ROOT}/example.env=~/examples/rsync-test" \\
     --use-rsync \\
+    --silent \\
     --debug
 EOF
   "${RHCTL_BIN}" transfer \
@@ -279,8 +294,9 @@ EOF
     --user "${RHCTL_USER}" \
     --ssh-port "${RHCTL_SSH_PORT}" \
     --password "${RHCTL_PASSWORD}" \
-    --upload "${ASSETS_ROOT}/example1.txt=~/examples/rsync-test" \
+    --upload "${ASSETS_ROOT}/example.env=~/examples/rsync-test" \
     --use-rsync \
+    --silent \
     --debug
   if [[ $? -eq 0 ]]; then
     log_pass "transfer upload with --use-rsync"
@@ -296,8 +312,9 @@ cat <<EOF
     --user "${RHCTL_USER}" \\
     --ssh-port "${RHCTL_SSH_PORT}" \\
     --password "${RHCTL_PASSWORD}" \\
-    --download "~/examples/example1.txt=/tmp/rhctl-test-downloads-rsync" \\
+    --download "~/examples/example.env=/tmp/rhctl-test-downloads-rsync" \\
     --use-rsync \\
+    --silent \\
     --debug
 EOF
   "${RHCTL_BIN}" transfer \
@@ -305,8 +322,9 @@ EOF
     --user "${RHCTL_USER}" \
     --ssh-port "${RHCTL_SSH_PORT}" \
     --password "${RHCTL_PASSWORD}" \
-    --download "~/examples/example1.txt=/tmp/rhctl-test-downloads-rsync" \
+    --download "~/examples/example.env=/tmp/rhctl-test-downloads-rsync" \
     --use-rsync \
+    --silent \
     --debug
   if [[ $? -eq 0 ]]; then
     log_pass "transfer download with --use-rsync"
@@ -331,6 +349,7 @@ cat <<EOF
     --remote-upload "/tmp/rhctl-test-patch-upload.txt" \\
     --remote-path "~/examples/example-patch-remote.txt" \\
     --remote-backup "/tmp/rhctl-test-patch-remote.bak" \\
+    --silent \\
     --debug
 EOF
   "${RHCTL_BIN}" patch \
@@ -342,6 +361,7 @@ EOF
     --remote-upload "/tmp/rhctl-test-patch-upload.txt" \
     --remote-path "~/examples/example-patch-remote.txt" \
     --remote-backup "/tmp/rhctl-test-patch-remote.bak" \
+    --silent \
     --debug
   if [[ $? -eq 0 ]]; then
     log_pass "patch (upload, backup, overwrite)"
@@ -362,6 +382,7 @@ cat <<EOF
     --remote-path "~/examples/example-patch-remote.txt" \\
     --remote-backup "/tmp/rhctl-test-patch-remote.bak" \\
     --recover \\
+    --silent \\
     --debug
 EOF
   "${RHCTL_BIN}" patch \
@@ -374,6 +395,7 @@ EOF
     --remote-path "~/examples/example-patch-remote.txt" \
     --remote-backup "/tmp/rhctl-test-patch-remote.bak" \
     --recover \
+    --silent \
     --debug
   if [[ $? -eq 0 ]]; then
     log_pass "patch (recover from backup)"
@@ -390,19 +412,11 @@ test_run() {
   echo "Test 1: run with config.yml (dev-deploy)"
 cat <<EOF
 # >>> ${RHCTL_BIN} run
-    --host "${RHCTL_HOST}" \\
-    --user "${RHCTL_USER}" \\
-    --ssh-port "${RHCTL_SSH_PORT}" \\
-    --password "${RHCTL_PASSWORD}" \\
     --config "${PROJECT_ROOT}/config.yml" \\
     --config-name dev-deploy \\
     --debug
 EOF
   "${RHCTL_BIN}" run \
-    --host "${RHCTL_HOST}" \
-    --user "${RHCTL_USER}" \
-    --ssh-port "${RHCTL_SSH_PORT}" \
-    --password "${RHCTL_PASSWORD}" \
     --config "${PROJECT_ROOT}/config.yml" \
     --config-name dev-deploy \
     --debug
