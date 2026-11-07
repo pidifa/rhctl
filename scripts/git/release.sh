@@ -175,7 +175,7 @@ git show-ref --verify --quiet "refs/heads/${FROM_BRANCH}" \
 gh auth status >/dev/null 2>&1 \
     || error "GitHub CLI is not authenticated."
 
-RELEASE_BRANCH="release/${VERSION}"
+RELEASE_BRANCH="release/${VERSION#v}"
 
 # ========================================================================= Release branch
 
