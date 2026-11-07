@@ -7,7 +7,7 @@
 ### Installation 🧰
 #### Homebrew (macOS / Linux)
 ```bash
-brew install saidake/rhctl/rhctl
+brew install pidifa/rhctl/rhctl
 ```
 #### Linux (x86_64)
 ```bash
