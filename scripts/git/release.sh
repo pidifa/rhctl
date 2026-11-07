@@ -177,17 +177,17 @@ gh auth status >/dev/null 2>&1 \
 
 # ========================================================================= Push from-branch to remote
 
-echo "==> Push ${FROM_BRANCH} -> ${REMOTE}/${FROM_BRANCH} (force)"
+echo "==> Push ${FROM_BRANCH} -> ${REMOTE}/${FROM_BRANCH}"
 
-git push --force "$REMOTE" "refs/heads/${FROM_BRANCH}:refs/heads/${FROM_BRANCH}"
+git push "$REMOTE" "refs/heads/${FROM_BRANCH}:refs/heads/${FROM_BRANCH}"
 
 RELEASE_BRANCH="release/${VERSION#v}"
 
 # ========================================================================= Release branch
 
-echo "==> Push ${FROM_BRANCH} -> ${REMOTE}/${RELEASE_BRANCH} (force)"
+echo "==> Push ${FROM_BRANCH} -> ${REMOTE}/${RELEASE_BRANCH}"
 
-git push --force "$REMOTE" "refs/heads/${FROM_BRANCH}:refs/heads/${RELEASE_BRANCH}"
+git push "$REMOTE" "refs/heads/${FROM_BRANCH}:refs/heads/${RELEASE_BRANCH}"
 
 # ========================================================================= Release tag
 
