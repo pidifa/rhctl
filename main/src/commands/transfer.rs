@@ -1,6 +1,6 @@
 use crate::common::ssh_pool::{RemotePathKind, ServerPool};
 use crate::domain::cmd_params::{ServerMetadata, TransferCmdConfig};
-use crate::domain::constants::TRANSFER_TASK_NAME;
+use crate::domain::constants::{DEFAULT_TRANSFER_CONCURRENCY, TRANSFER_TASK_NAME};
 use crate::utils::file_utils::{
     expand_local_user_path, format_env_file, load_local_env_file, local_path_kind,
     merge_env_entries, parse_env_file_contents, LocalPathKind, TransferMapping,
@@ -10,6 +10,7 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use futures::future::join_all;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
@@ -130,6 +131,8 @@ pub async fn run(
         return Err("Provide at least one of --upload or --download or --patch-env".to_string());
     }
     let mut tasks = Vec::new();
+    // Limit concurrent transfers to avoid exhausting SSH sessions/file descriptors.
+    let semaphore = Arc::new(Semaphore::new(DEFAULT_TRANSFER_CONCURRENCY));
 
     for mapping in uploads {
         let source_kind = local_path_kind(&mapping.source).map_err(|e| {
@@ -233,7 +236,12 @@ pub async fn run(
         let server_metadata_clone = server_metadata.clone();
         let source_raw = mapping.source.clone();
         let target_raw = mapping.target.clone();
+        let semaphore_clone = semaphore.clone();
         tasks.push(tokio::spawn(async move {
+            let _permit = semaphore_clone
+                .acquire()
+                .await
+                .map_err(|e| format!("Transfer semaphore closed: {}", e))?;
             let res = if op == 0 || op == 2 {
                 global_server_pool_clone
                     .upload_file_to_file(
@@ -394,7 +402,12 @@ pub async fn run(
         let server_metadata_clone = server_metadata.clone();
         let source_raw = mapping.source.clone();
         let target_raw = mapping.target.clone();
+        let semaphore_clone = semaphore.clone();
         tasks.push(tokio::spawn(async move {
+            let _permit = semaphore_clone
+                .acquire()
+                .await
+                .map_err(|e| format!("Transfer semaphore closed: {}", e))?;
             let res = if dop == 0 || dop == 2 {
                 global_server_pool_clone
                     .download_file_to_file(

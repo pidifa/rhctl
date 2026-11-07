@@ -44,6 +44,7 @@ use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
+use tokio::process::Command as TokioCommand;
 use tokio::sync::oneshot;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::{self};
@@ -1203,6 +1204,31 @@ impl ServerPool {
         print_log: bool,
     ) -> Result<(), String> {
         if local_file_or_dir.is_dir() {
+            // When not using rsync, transfer the directory as a single tar archive
+            // over SCP to avoid per-file round-trips (channel open, header, data,
+            // ACKs for every file). With rsync we keep the existing per-entry
+            // iteration since rsync handles directories efficiently.
+            if !use_rsync {
+                self.ask_safe_to_transfer(
+                    server_metadata,
+                    task_name,
+                    remote_dir,
+                    use_sudo,
+                    silent,
+                )
+                .await?;
+
+                return self
+                    .upload_dir_via_tar_scp(
+                        server_metadata,
+                        task_name,
+                        local_file_or_dir,
+                        remote_dir,
+                        use_sudo,
+                    )
+                    .await;
+            }
+
             for entry in std::fs::read_dir(local_file_or_dir).map_err(|e| {
                 format!(
                     "Failed to read local directory '{}'. \n\t> {}",
@@ -1286,6 +1312,106 @@ impl ServerPool {
 
         Ok(())
     }
+
+    /// Upload a local directory to a remote directory via SCP using a tar archive.
+    ///
+    /// Instead of opening one SSH channel per file (each with channel open,
+    /// header, data, and ACK round-trips), we create a single tar archive
+    /// locally, transfer it as one SCP file, and extract it remotely. This
+    /// reduces N round-trips to ~1 and is especially beneficial for directories
+    /// containing many small files.
+    async fn upload_dir_via_tar_scp(
+        &self,
+        server_metadata: &Arc<ServerMetadata>,
+        task_name: &str,
+        local_dir: &Path,
+        remote_dir: &str,
+        use_sudo: bool,
+    ) -> Result<(), String> {
+        // Create a tar archive of the directory in the system temp folder.
+        let tar_temp = std::env::temp_dir().join(format!(
+            "rhctl-upload-{}.tar",
+            std::process::id()
+        ));
+
+        let dir_parent = local_dir.parent().unwrap_or(local_dir);
+        let dir_name = local_dir
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+
+        let tar_status = std::process::Command::new("tar")
+            .arg("-cf")
+            .arg(&tar_temp)
+            .arg("-C")
+            .arg(dir_parent)
+            .arg(&dir_name)
+            .status()
+            .map_err(|e| format!("Failed to create tar archive: {}", e))?;
+
+        if !tar_status.success() {
+            return Err("Failed to create tar archive".to_string());
+        }
+
+        // Ensure the remote target directory exists.
+        self.create_remote_dir_if_not_exists(server_metadata, task_name, remote_dir, use_sudo)
+            .await?;
+
+        // Upload the tar file as a single SCP file into the remote directory.
+        self.do_upload(
+            server_metadata,
+            task_name,
+            use_sudo,
+            false, // force SCP (not rsync) for the tar file
+            Path::new(&tar_temp),
+            remote_dir,
+            Some(".rhctl-upload.tar"),
+        )
+        .await?;
+
+        // Extract the archive into the remote directory, stripping the top-level
+        // directory name so contents land directly in `remote_dir`.
+        let extract_cmd = if use_sudo && server_metadata.user != "root" {
+            format!(
+                "sudo -n tar -xf {} --strip-components=1 -C {}",
+                remote_dir.trim_end_matches('/'),
+                remote_dir
+            )
+        } else {
+            format!(
+                "tar -xf {} --strip-components=1 -C {}",
+                remote_dir.trim_end_matches('/'),
+                remote_dir
+            )
+        };
+
+        self.exec(server_metadata, task_name, &extract_cmd, use_sudo)
+            .await?;
+
+        // Clean up the remote tar file.
+        let cleanup_cmd = format!(
+            "rm -f {}/.rhctl-upload.tar",
+            remote_dir.trim_end_matches('/')
+        );
+        let _ = self
+            .exec(server_metadata, task_name, &cleanup_cmd, use_sudo)
+            .await;
+
+        // Clean up the local tar file.
+        let _ = std::fs::remove_file(&tar_temp);
+
+        log_info!(
+            server_metadata,
+            task_name,
+            "Successfully uploaded the contents of the folder '{}' into '{}' via tar",
+            local_dir.display(),
+            remote_dir
+        );
+
+        Ok(())
+    }
+
     pub async fn upload_file_to_file(
         &self,
         server_metadata: &Arc<ServerMetadata>,
@@ -1591,16 +1717,20 @@ impl ServerPool {
         let status = if let Some(ref identity_file) = server_metadata.identity_file {
             let identity_path = expand_local_user_path(identity_file);
             let ssh_cmd = format!("ssh -p {} -i {}", server_metadata.ssh_port, identity_path);
-            std::process::Command::new("rsync")
+            let status = TokioCommand::new("rsync")
                 .arg("-a")
                 .arg("-e")
                 .arg(&ssh_cmd)
                 .arg(&remote_spec)
                 .arg(stage_dir)
                 .status()
-                .map_err(|e| format!("Failed to execute rsync download with identity: {}", e))?
+                .await
+                .map_err(|e| format!("Failed to execute rsync download with identity: {}", e))?;
+            if !status.success() {
+                return Err(format!("rsync download with identity failed with exit code {:?}", status.code()));
+            }
         } else if !server_metadata.password.is_empty() && self.command_exists("sshpass") {
-            std::process::Command::new("sshpass")
+            let status = TokioCommand::new("sshpass")
                 .arg("-p")
                 .arg(&server_metadata.password)
                 .arg("rsync")
@@ -1610,19 +1740,17 @@ impl ServerPool {
                 .arg(&remote_spec)
                 .arg(stage_dir)
                 .status()
-                .map_err(|e| format!("Failed to execute rsync download via sshpass: {}", e))?
+                .await
+                .map_err(|e| format!("Failed to execute rsync download via sshpass: {}", e))?;
+            if !status.success() {
+                return Err(format!("rsync download via sshpass failed with exit code {:?}", status.code()));
+            }
         } else {
             return Err(
                 "rsync download requires an identity file or sshpass for password authentication"
                     .to_string(),
             );
         };
-        if !status.success() {
-            return Err(format!(
-                "rsync download failed with exit code {}",
-                status.code().unwrap_or(-1)
-            ));
-        }
         log_debug!(
             server_metadata,
             task_name,
@@ -2150,7 +2278,7 @@ impl ServerPool {
             // Send file data
             let mut reader =
                 BufReader::new(File::open(local_file_or_dir).map_err(|e| e.to_string())?);
-            let mut buf = [0u8; 8192];
+            let mut buf = [0u8; 65536];
             loop {
                 let n = reader.read(&mut buf).map_err(|e| e.to_string())?;
                 if n == 0 {
@@ -2187,20 +2315,46 @@ impl ServerPool {
 
     async fn wait_for_ack(&self, channel: &mut russh::Channel<Msg>) -> Result<(), String> {
         let mut ack_buf = Vec::new();
+        let mut stderr_buf = Vec::new();
         while let Some(msg) = channel.wait().await {
-            if let ChannelMsg::Data { data } = msg {
-                ack_buf.extend_from_slice(&data);
-                if ack_buf.contains(&0) {
-                    return Ok(());
-                } else if ack_buf.contains(&1) || ack_buf.contains(&2) {
-                    return Err(format!(
-                        "SCP remote error: {:?}",
-                        String::from_utf8_lossy(&ack_buf)
-                    ));
+            match msg {
+                ChannelMsg::Data { data } => {
+                    ack_buf.extend_from_slice(&data);
+                    if ack_buf.contains(&0) {
+                        return Ok(());
+                    } else if ack_buf.contains(&1) || ack_buf.contains(&2) {
+                        return Err(format!(
+                            "SCP remote error: {}{}",
+                            String::from_utf8_lossy(&ack_buf),
+                            Self::stderr_tail(&stderr_buf)
+                        ));
+                    }
                 }
+                ChannelMsg::ExtendedData { ext: 1, data } => {
+                    // ext code 1 is stderr on the SSH channel.
+                    stderr_buf.extend_from_slice(&data);
+                }
+                ChannelMsg::ExtendedData { .. } => {
+                    // Ignore other extended data codes.
+                }
+                _ => continue,
             }
         }
-        Err("SCP: No ACK from server".to_string())
+        let stderr_tail = Self::stderr_tail(&stderr_buf);
+        Err(format!("SCP: No ACK from server{}", stderr_tail))
+    }
+
+    fn stderr_tail(buf: &[u8]) -> String {
+        let text = String::from_utf8_lossy(buf);
+        let text = text.trim();
+        if text.is_empty() {
+            String::new()
+        } else {
+            // Keep only the last few lines to avoid flooding the error message.
+            let lines: Vec<&str> = text.lines().rev().take(5).collect();
+            let tail: String = lines.into_iter().rev().collect::<Vec<&str>>().join("\n");
+            format!("\nRemote SCP stderr:\n{}", tail)
+        }
     }
 
     fn command_exists(&self, cmd: &str) -> bool {
@@ -2267,7 +2421,7 @@ impl ServerPool {
             if let Some(ref identity_file) = server_metadata.identity_file {
                 let identity_path = expand_local_user_path(identity_file);
                 let ssh_cmd = format!("ssh -p {} -i {}", server_metadata.ssh_port, identity_path);
-                let status = std::process::Command::new("rsync")
+                let status = TokioCommand::new("rsync")
                     .arg("-avz")
                     .arg("-e")
                     .arg(&ssh_cmd)
@@ -2276,12 +2430,13 @@ impl ServerPool {
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
                     .status()
+                    .await
                     .map_err(|e| format!("Failed to execute rsync with identity. \n\t> {}", e))?;
 
                 if !status.success() {
                     return Err(format!(
-                        "rsync (identity) failed with exit code {}",
-                        status.code().unwrap_or(-1)
+                        "rsync (identity) failed with exit code {:?}",
+                        status.code()
                     ));
                 }
                 return Ok(());
@@ -2289,7 +2444,7 @@ impl ServerPool {
 
             if !server_metadata.password.is_empty() {
                 if self.command_exists("sshpass") {
-                    let mut sshpass_cmd = std::process::Command::new("sshpass");
+                    let mut sshpass_cmd = TokioCommand::new("sshpass");
                     sshpass_cmd
                         .arg("-p")
                         .arg(&server_metadata.password)
@@ -2304,12 +2459,13 @@ impl ServerPool {
 
                     let status = sshpass_cmd
                         .status()
+                        .await
                         .map_err(|e| format!("Failed to execute rsync via sshpass. \n\t> {}", e))?;
 
                     if !status.success() {
                         return Err(format!(
-                            "rsync (sshpass) failed with exit code {}",
-                            status.code().unwrap_or(-1)
+                            "rsync (sshpass) failed with exit code {:?}",
+                            status.code()
                         ));
                     }
                     return Ok(());
