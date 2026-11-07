@@ -1002,6 +1002,11 @@ impl ServerPool {
         let cmd = cmd.to_string();
         let mut channel_guard = self.get_channel(server_metadata).await?;
 
+        // When no password is available (identity / key-based auth) use
+        // non-interactive `sudo -n` so the command does not block waiting for
+        // a password prompt that can never be satisfied.
+        let sudo_interactive = use_sudo && !server_metadata.password.is_empty();
+
         log_debug!(
             server_metadata,
             task_name,
@@ -1014,9 +1019,14 @@ impl ServerPool {
             let quoted = shlex::try_quote(cmd.as_str())
                 .map_err(|e| format!("Failed to quote sudo command: {}", e))?;
 
+            let sudo_prefix = if sudo_interactive {
+                "sudo -S -p '[RHCTL_SUDO_PASSWORD]'"
+            } else {
+                "sudo -n"
+            };
             // Use an explicit prompt so we can distinguish the sudo password
             // request from normal command output.
-            format!("sudo -S -p '[RHCTL_SUDO_PASSWORD]' bash -c {}", quoted)
+            format!("{} bash -c {}", sudo_prefix, quoted)
         } else {
             cmd.to_string()
         };
@@ -1029,7 +1039,7 @@ impl ServerPool {
             use_sudo
         );
 
-        if use_sudo {
+        if sudo_interactive {
             channel_guard
                 .channel
                 .request_pty(true, "xterm", 0, 0, 0, 0, &[])
@@ -1057,7 +1067,7 @@ impl ServerPool {
         let mut stderr_progress = CrProgressPrinter::new();
 
         let mut saw_exit_status = false;
-        let mut sudo_password_sent = !use_sudo;
+        let mut sudo_password_sent = !sudo_interactive;
 
         while let Some(msg) = channel_guard.channel.wait().await {
             match msg {
@@ -1065,7 +1075,7 @@ impl ServerPool {
                     let data_str = String::from_utf8_lossy(&data);
 
                     // sudo may send its password prompt through the PTY.
-                    if use_sudo && !sudo_password_sent && data_str.contains("[RHCTL_SUDO_PASSWORD]")
+                    if sudo_interactive && !sudo_password_sent && data_str.contains("[RHCTL_SUDO_PASSWORD]")
                     {
                         let pw_with_newline = format!("{}\n", server_metadata.password);
 
@@ -1337,8 +1347,16 @@ impl ServerPool {
             .await?;
 
         // Build the remote extraction command that reads tar from stdin.
+        // When no password is available (identity / key-based auth) use
+        // non-interactive `sudo -n` so the command does not block waiting for
+        // a password prompt that can never be satisfied.
         let extract_cmd = if use_sudo && server_metadata.user != "root" {
-            format!("sudo -S tar -xf - --strip-components=1 -C {}", remote_dir)
+            let sudo_prefix = if server_metadata.password.is_empty() {
+                "sudo -n"
+            } else {
+                "sudo -S -p '[RHCTL_SUDO_PASSWORD]'"
+            };
+            format!("{} tar -xf - --strip-components=1 -C {}", sudo_prefix, remote_dir)
         } else {
             format!("tar -xf - --strip-components=1 -C {}", remote_dir)
         };
@@ -1360,7 +1378,9 @@ impl ServerPool {
             .map_err(|e| format!("Failed to exec remote tar extraction: {}", e))?;
 
         // If using sudo -S, feed the password before the tar stream.
-        if use_sudo && server_metadata.user != "root" {
+        // Skipped when no password is available (identity mode): `sudo -n` does
+        // not prompt for a password.
+        if use_sudo && server_metadata.user != "root" && !server_metadata.password.is_empty() {
             let password_with_newline = format!("{}
 ", server_metadata.password);
             channel_guard
@@ -2292,7 +2312,15 @@ impl ServerPool {
             .map_err(|e| format!("Invalid remote target '{}': {}", remote_target, e))?;     
 
         let scp_cmd = if use_sudo && server_metadata.user != "root" {
-            format!("sudo -S scp -t {}", quoted_target)
+            // When no password is available (identity / key-based auth) use
+            // non-interactive `sudo -n` so the SCP protocol does not block
+            // waiting for a password prompt.
+            let sudo_prefix = if server_metadata.password.is_empty() {
+                "sudo -n"
+            } else {
+                "sudo -S -p '[RHCTL_SUDO_PASSWORD]'"
+            };
+            format!("{} scp -t {}", sudo_prefix, quoted_target)
         } else {
             format!("scp -t {}", quoted_target)
         };
@@ -2316,7 +2344,9 @@ impl ServerPool {
 
             // If using sudo -S, feed the password to sudo before the SCP protocol starts.
             // sudo reads the password from stdin, then execs scp -t with the remaining stdin.
-            if use_sudo && server_metadata.user != "root" {
+            // Skipped when no password is available (identity mode): `sudo -n` does
+            // not prompt for a password.
+            if use_sudo && server_metadata.user != "root" && !server_metadata.password.is_empty() {
                 let password_with_newline = format!("{}
 ", server_metadata.password);
                 channel_guard

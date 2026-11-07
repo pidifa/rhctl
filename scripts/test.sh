@@ -16,6 +16,7 @@
 #   RHCTL_HOST=<host>         Remote host (default: 192.168.75.128)
 #   RHCTL_USER=<user>         Remote user (default: test99)
 #   RHCTL_PASSWORD=<pass>     Remote password (default: testpwd)
+#   RHCTL_IDENTITY=<key>      SSH identity file (default: $HOME/.ssh/id_ed25519)
 #   RHCTL_SSH_PORT=<port>     SSH port (default: 22)
 #   RHCTL_BIN=<path>          Path to rhctl binary (default: rhctl from PATH)
 #
@@ -32,6 +33,7 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 RHCTL_HOST="${RHCTL_HOST:-192.168.75.128}"
 RHCTL_USER="${RHCTL_USER:-test99}"
 RHCTL_PASSWORD="${RHCTL_PASSWORD:-testpwd}"
+RHCTL_IDENTITY="${RHCTL_IDENTITY:-$HOME/.ssh/id_ed25519}"
 RHCTL_SSH_PORT="${RHCTL_SSH_PORT:-22}"
 RHCTL_BIN="${RHCTL_BIN:-rhctl}"
 
@@ -164,6 +166,40 @@ EOF
   else
     log_fail "execute with script parameters (sync)"
     exit 1
+  fi
+
+  echo "Test 4: execute with --identity and --use-sudo (no password)"
+  if [[ ! -f "${RHCTL_IDENTITY}" ]]; then
+    log_skip "execute with --identity and --use-sudo (no password) - identity file not found: ${RHCTL_IDENTITY}"
+  else
+cat <<EOF
+# >>> ${RHCTL_BIN} execute
+    --host "${RHCTL_HOST}" \
+    --user "${RHCTL_USER}" \
+    --ssh-port "${RHCTL_SSH_PORT}" \
+    --identity "${RHCTL_IDENTITY}" \
+    --script "${ASSETS_ROOT}/example-bash1.sh" \
+    --mode async \
+    --use-sudo \
+    --silent \
+    --debug
+EOF
+    "${RHCTL_BIN}" execute \
+      --host "${RHCTL_HOST}" \
+      --user "${RHCTL_USER}" \
+      --ssh-port "${RHCTL_SSH_PORT}" \
+      --identity "${RHCTL_IDENTITY}" \
+      --script "${ASSETS_ROOT}/example-bash1.sh" \
+      --mode async \
+      --use-sudo \
+      --silent \
+      --debug
+    if [[ $? -eq 0 ]]; then
+      log_pass "execute with --identity and --use-sudo (no password)"
+    else
+      log_fail "execute with --identity and --use-sudo (no password)"
+      exit 1
+    fi
   fi
 }
 
