@@ -147,7 +147,7 @@ jobs:
           chmod +x scripts/update-homebrew-formula.sh
 
           git clone --depth 1 \
-            "https://x-access-token:${GIT_TOKEN}@github.com/saidake/homebrew-rhctl.git" \
+            "https://x-access-token:${GIT_TOKEN}@github.com/pidifa/homebrew-rhctl.git" \
             homebrew-rhctl
 
           ./scripts/update-homebrew-formula.sh \

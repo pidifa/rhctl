@@ -4,7 +4,7 @@ Welcome! This short guide explains how to contribute effectively to **rhctl**.
 
 ## Submitting an issue
 
-- If you find a bug, please submit an issue to our GitHub [repository](https://github.com/saidake/rhctl/issues).
+- If you find a bug, please submit an issue to our GitHub [repository](https://github.com/pidifa/rhctl/issues).
 - Before submitting, search the issue tracker to see if your problem already exists. Existing issues may already have workarounds or ongoing fixes.
 - Include the `rhctl` version, OS, and enough detail to reproduce the problem (commands, config snippets, and logs help a lot).
 

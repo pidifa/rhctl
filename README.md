@@ -1,6 +1,6 @@
 # rhctl (Remote Host Control)
 ![GitHub release (latest SemVer)](https://img.shields.io/github/v/release/saidake/rhctl?sort=semver)
-![Build Status](https://github.com/saidake/rhctl/actions/workflows/release.yml/badge.svg)
+![Build Status](https://github.com/pidifa/rhctl/actions/workflows/release.yml/badge.svg)
 
 <img src="docs/assets/logo.png" width="100">
 
@@ -45,7 +45,7 @@
 ```bash
 brew install saidake/rhctl/rhctl
 ```
-Prebuilt binaries are also attached to each [GitHub Release](https://github.com/saidake/rhctl/releases).
+Prebuilt binaries are also attached to each [GitHub Release](https://github.com/pidifa/rhctl/releases).
 # Build
 ```bash
 cd main && cargo build --release && cd ..

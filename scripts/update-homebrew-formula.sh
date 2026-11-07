@@ -41,14 +41,14 @@ LINUX_SHA="$(sha256_file "$LINUX")"
 MACOS_X64_SHA="$(sha256_file "$MACOS_X64")"
 MACOS_ARM64_SHA="$(sha256_file "$MACOS_ARM64")"
 
-BASE_URL="https://github.com/saidake/rhctl/releases/download/v${VERSION}"
+BASE_URL="https://github.com/pidifa/rhctl/releases/download/v${VERSION}"
 
 mkdir -p "$(dirname "$OUTPUT")"
 
 cat >"$OUTPUT" <<EOF
 class Rhctl < Formula
   desc "High-performance Rust CLI tool for remote host management"
-  homepage "https://github.com/saidake/rhctl"
+  homepage "https://github.com/pidifa/rhctl"
   version "${VERSION}"
   license "Apache-2.0"
 
