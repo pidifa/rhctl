@@ -179,43 +179,33 @@ RELEASE_BRANCH="release/${VERSION}"
 
 # ========================================================================= Release branch
 
-echo "==> Push ${FROM_BRANCH} -> ${REMOTE}/${RELEASE_BRANCH}"
+echo "==> Push ${FROM_BRANCH} -> ${REMOTE}/${RELEASE_BRANCH} (force)"
 
-git push "$REMOTE" "${FROM_BRANCH}:${RELEASE_BRANCH}"
+git push --force "$REMOTE" "refs/heads/${FROM_BRANCH}:refs/heads/${RELEASE_BRANCH}"
 
 # ========================================================================= Release tag
 
-if git rev-parse --verify "$VERSION" >/dev/null 2>&1; then
-    TAG_COMMIT="$(git rev-list -n 1 "$VERSION")"
-    SOURCE_COMMIT="$(git rev-list -n 1 "$FROM_BRANCH")"
+echo "==> Create tag ${VERSION} (force)"
 
-    [[ "$TAG_COMMIT" == "$SOURCE_COMMIT" ]] \
-        || error "Existing tag '$VERSION' does not point to '$FROM_BRANCH'."
+git tag --force "$VERSION"
 
-    echo "==> Tag already exists locally: ${VERSION}"
-else
-    echo "==> Create tag ${VERSION}"
-    git tag "$VERSION"
-fi
+echo "==> Push tag ${VERSION} (force)"
 
-if git ls-remote --exit-code --tags "$REMOTE" "refs/tags/${VERSION}" >/dev/null 2>&1; then
-    echo "==> Tag already exists on ${REMOTE}: ${VERSION}"
-else
-    echo "==> Push tag ${VERSION}"
-    git push "$REMOTE" "$VERSION"
-fi
+git push --force "$REMOTE" "$VERSION"
 
 # ========================================================================= GitHub release
 
 if gh release view "$VERSION" >/dev/null 2>&1; then
-    echo "==> GitHub release already exists: ${VERSION}"
-else
-    echo "==> Create GitHub release ${VERSION}"
+    echo "==> Delete existing GitHub release ${VERSION}"
 
-    gh release create "$VERSION" \
-        --title "$VERSION" \
-        --notes-file "$RELEASE_NOTES"
+    gh release delete "$VERSION" --yes
 fi
+
+echo "==> Create GitHub release ${VERSION}"
+
+gh release create "$VERSION" \
+    --title "$VERSION" \
+    --notes-file "$RELEASE_NOTES"
 
 # ========================================================================= Pull request
 
