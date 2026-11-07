@@ -1,30 +1,8 @@
 # What's New
 
-## 🧪 Test Suite Fixes (`scripts/test.sh`)
+## 📦 Repository Migration
 
-- **Fixed `rhctl run` test**: Removed invalid `--host`, `--user`, `--ssh-port`,
-  and `--password` arguments from the `rhctl run` test case. These options are
-  not accepted by `rhctl run` — server connection details are sourced from
-  `config.yml` via `target-servers`.
-- **Fixed `transfer patch-env` test**: Replaced `assets/example1.txt` (which
-  contained plain text `rhctl example file 1`, not valid `KEY=VALUE` format)
-  with new `assets/example.env` containing proper `.env` entries:
-  ```
-  RHCTL_APP_NAME=test-app
-  RHCTL_APP_PORT=8080
-  RHCTL_DB_HOST=localhost
-  RHCTL_DB_PORT=5432
-  export RHCTL_DEBUG=true
-  ```
-- **Added `--silent` to all test commands**: Every `rhctl execute`, `rhctl
-  transfer`, `rhctl patch`, and `rhctl run` invocation in the test suite now
-  includes the `--silent` flag to suppress interactive prompts during automated
-  runs.
-
-## 📦 New Test Asset
-
-- **`assets/example.env`**: Valid `.env` file for `patch-env` testing with
-  `KEY=VALUE` entries, comment lines, and `export` prefix support.
+- Transferred repository to pidifa: The rhctl repository has been transferred to the pidifa organization.
 
 ### Installation 🧰
 #### Homebrew (macOS / Linux)
