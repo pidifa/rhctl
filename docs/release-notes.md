@@ -1,3 +1,25 @@
+=================================================== Release Branch
+release/1.0.6
+
+=================================================== Release Tag
+Format:
+    v[version]
+Example:
+    v1.0.6
+
+=================================================== Release Title
+Format:
+    v[version]
+Example:
+    v1.0.6
+
+=================================================== Release Description Format
+Write the GitHub Release description manually (CI attaches artifacts and
+updates the Homebrew tap; it does not generate or overwrite release notes).
+
+Requires repository secret GIT_TOKEN with Contents write access to
+saidake/homebrew-rhctl.
+
 # What's New
 
 ## 🧪 Test Suite Fixes (`scripts/test.sh`)
@@ -34,33 +56,33 @@ brew install saidake/rhctl/rhctl
 #### Linux (x86_64)
 ```bash
 # Download
-curl -LO https://github.com/saidake/rhctl/releases/download/v1.0.5/rhctl-v1.0.5-linux-x86_64
+curl -LO https://github.com/saidake/rhctl/releases/download/v1.0.6/rhctl-v1.0.6-linux-x86_64
 
 # Make executable
-chmod +x rhctl-v1.0.5-linux-x86_64
+chmod +x rhctl-v1.0.6-linux-x86_64
 
 # Move to /usr/local/bin
-sudo mv rhctl-v1.0.5-linux-x86_64 /usr/local/bin/rhctl
+sudo mv rhctl-v1.0.6-linux-x86_64 /usr/local/bin/rhctl
 ```
 #### macOS (x86_64)
 ```bash
 # Download
-curl -LO https://github.com/saidake/rhctl/releases/download/v1.0.5/rhctl-v1.0.5-macos-x86_64
+curl -LO https://github.com/saidake/rhctl/releases/download/v1.0.6/rhctl-v1.0.6-macos-x86_64
 
 # Make executable
-chmod +x rhctl-v1.0.5-macos-x86_64
+chmod +x rhctl-v1.0.6-macos-x86_64
 
 # Move to /usr/local/bin
-sudo mv rhctl-v1.0.5-macos-x86_64 /usr/local/bin/rhctl
+sudo mv rhctl-v1.0.6-macos-x86_64 /usr/local/bin/rhctl
 ```
 #### macOS (ARM64 / Apple Silicon)
 ```bash
 # Download
-curl -LO https://github.com/saidake/rhctl/releases/download/v1.0.5/rhctl-v1.0.5-macos-arm64
+curl -LO https://github.com/saidake/rhctl/releases/download/v1.0.6/rhctl-v1.0.6-macos-arm64
 
 # Make executable
-chmod +x rhctl-v1.0.5-macos-arm64
+chmod +x rhctl-v1.0.6-macos-arm64
 
 # Move to /usr/local/bin
-sudo mv rhctl-v1.0.5-macos-arm64 /usr/local/bin/rhctl
+sudo mv rhctl-v1.0.6-macos-arm64 /usr/local/bin/rhctl
 ```
