@@ -193,7 +193,7 @@ git push "$REMOTE" "refs/heads/${FROM_BRANCH}:refs/heads/${RELEASE_BRANCH}"
 
 echo "==> Create tag ${VERSION}"
 
-git tag "$VERSION"
+git tag --force "$VERSION"
 
 echo "==> Push tag ${VERSION} (force)"
 
