@@ -1,6 +1,6 @@
 # What's New
 
-- Check whether a password is required when using sudo if the server does not allow passwordless sudo.
+- Fixed `=>` (contents-only) transfer merging into an existing remote directory instead of attempting to delete it, which previously failed with `Refusing to delete critical system path` for protected paths such as `/etc/systemd/system`.
 
 ### Installation 🧰
 #### Homebrew (macOS / Linux)

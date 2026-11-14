@@ -1227,12 +1227,17 @@ impl ServerPool {
             // ACKs for every file). With rsync we keep the existing per-entry
             // iteration since rsync handles directories efficiently.
             if !use_rsync {
-                self.ask_safe_to_transfer(
+                // Upload contents INTO the directory: do NOT delete the target
+                // directory. Just ensure it exists, then stream the tar archive
+                // into it (tar --strip-components=1 merges files without removing
+                // the directory itself). Deleting the target is only correct for
+                // the replace-dir op (`=`), not for contents-only (`=>`) or
+                // file-into-dir (`op == 1`).
+                self.create_remote_dir_if_not_exists(
                     server_metadata,
                     task_name,
                     remote_dir,
                     use_sudo,
-                    silent,
                 )
                 .await?;
 
