@@ -1,6 +1,6 @@
 [package]
 name = "rhctl"
-version = "1.0.8"
+version = "1.0.9"
 edition = "2024"
 description = "High-performance Rust CLI tool for remote host management, enabling file transfers, script execution, and file patching via SSH. "
 license = "Apache-2.0"
