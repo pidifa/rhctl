@@ -419,6 +419,15 @@ impl SessionPool {
         Ok(wrapper)
     }
 
+    /// Drop a session whose SSH transport is no longer usable so it is not
+    /// reused for subsequent channels.
+    fn drop_dead_session(&self, dead: &LiveSessionWrapper) {
+        let mut active_guard = self.active_sessions.lock().unwrap();
+        active_guard.retain(|s| !Arc::ptr_eq(&s.live.raw, &dead.live.raw));
+        let mut idle_guard = self.idle_sessions.lock().unwrap();
+        idle_guard.retain(|i| !Arc::ptr_eq(&i.live.raw, &dead.live.raw));
+    }
+
     fn recycle_session(&self) {
         let mut active_guard = self.active_sessions.lock().unwrap();
         let mut idle_guard = self.idle_sessions.lock().unwrap();
@@ -649,17 +658,34 @@ impl ServerPool {
         server_metadata: &Arc<ServerMetadata>,
     ) -> Result<ChannelGuard, String> {
         let server_pool = self.get_session_pool(server_metadata).await;
-        let live_session_wrapper = server_pool
-            .get_session()
-            .await
-            .map_err(|e| format!("Get session error:\n\t> {}", e))?;
+        let mut last_err = String::new();
+        // Retry a few times when the SSH transport is disconnected. A session
+        // that appears live can have its transport severed between the
+        // is_closed() check and channel_open_session(); in that case we drop
+        // the dead session and open a fresh connection instead of aborting the
+        // whole transfer (e.g. patch-env right after the concurrent downloads).
+        for _ in 0..3 {
+            let live_session_wrapper = server_pool
+                .get_session()
+                .await
+                .map_err(|e| format!("Get session error:\n\t> {}", e))?;
 
-        let guard = live_session_wrapper
-            .get_channel_guard()
-            .await
-            .map_err(|e| format!("Get channel error:\n\t> {}", e))?;
-
-        Ok(guard)
+            match live_session_wrapper.get_channel_guard().await {
+                Ok(guard) => return Ok(guard),
+                Err(e) => {
+                    let msg = e.to_string();
+                    // A disconnected transport means the session is dead; drop it
+                    // so it is not reused, then retry with a fresh session.
+                    if msg.contains("Disconnected") {
+                        server_pool.drop_dead_session(&live_session_wrapper);
+                        last_err = format!("SSH error: {}", e);
+                        continue;
+                    }
+                    return Err(format!("Get channel error:\n\t> {}", e));
+                }
+            }
+        }
+        Err(format!("Get channel error:\n\t> {}", last_err))
     }
 
     pub fn start_idle_cleanup(self: Arc<Self>, interval: Duration) {
