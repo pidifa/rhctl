@@ -4,8 +4,13 @@
 
 ## Installation 🧰
 ### Homebrew (macOS / Linux)
+Install:
 ```bash
 brew install pidifa/rhctl/rhctl
+```
+Upgrade:
+```bash
+brew upgrade rhctl
 ```
 ### Linux (x86_64)
 ```bash

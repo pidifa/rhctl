@@ -151,6 +151,9 @@ REPO_DIR="$(cd "$REPO_DIR" && pwd)"
 git -C "$REPO_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
     || error "Not a Git repository: ${REPO_DIR}"
 
+SCRIPT_EXEC_DIR="$(pwd)"
+trap 'cd "$SCRIPT_EXEC_DIR"' EXIT
+
 REPO_ROOT="$(git -C "$REPO_DIR" rev-parse --show-toplevel)"
 
 cd "$REPO_ROOT"
